@@ -1,6 +1,9 @@
+# MASt3R Runtime - PyPI Package Configuration
+# Copyright 2024 Delanoe Pirard / Aedelon. Apache 2.0.
+
 [build-system]
-build-backend = "hatchling.build"
-requires = ["hatchling"]
+requires = ["scikit-build-core>=0.10", "pybind11>=2.12"]
+build-backend = "scikit_build_core.build"
 
 [project]
 name = "mast3r-runtime"
@@ -25,7 +28,8 @@ keywords = [
     "embedded",
     "coreml",
     "tensorrt",
-    "onnx",
+    "metal",
+    "cuda",
     "inference",
 ]
 
@@ -34,7 +38,9 @@ classifiers = [
     "Intended Audience :: Developers",
     "Intended Audience :: Science/Research",
     "License :: OSI Approved :: Apache Software License",
-    "Operating System :: OS Independent",
+    "Operating System :: MacOS :: MacOS X",
+    "Operating System :: POSIX :: Linux",
+    "Programming Language :: C++",
     "Programming Language :: Python :: 3",
     "Programming Language :: Python :: 3.10",
     "Programming Language :: Python :: 3.11",
@@ -57,41 +63,6 @@ dependencies = [
 ]
 
 [project.optional-dependencies]
-# ONNX Runtime - lightweight inference (recommended)
-onnx = [
-    "onnxruntime>=1.17",
-]
-
-# ONNX with GPU support (CUDA)
-onnx-gpu = [
-    "onnxruntime-gpu>=1.17",
-]
-
-# CUDA support (PyTorch with CUDA)
-cuda = [
-    "torch>=2.0",
-    "onnxruntime-gpu>=1.17",
-]
-
-# CoreML backend (Apple Silicon - macOS only)
-coreml = [
-    "coremltools>=7.0; sys_platform == 'darwin'",
-]
-
-# TensorRT backend (NVIDIA - Linux/Jetson only)
-tensorrt = [
-    "tensorrt>=8.6; sys_platform == 'linux'",
-    "cuda-python>=12.0; sys_platform == 'linux'",
-]
-
-# Export tools (requires PyTorch + MASt3R)
-export = [
-    "torch>=2.0",
-    "torchvision>=0.15",
-    "onnx>=1.15",
-    "onnxscript>=0.1",
-]
-
 # Development
 dev = [
     "pytest>=8.0",
@@ -101,9 +72,16 @@ dev = [
     "pre-commit>=3.0",
 ]
 
-# All inference backends
+# Export tools (requires PyTorch + MASt3R)
+export = [
+    "torch>=2.0",
+    "torchvision>=0.15",
+    "safetensors>=0.4",
+]
+
+# All development tools
 all = [
-    "mast3r-runtime[onnx,coreml,cuda]",
+    "mast3r-runtime[dev,export]",
 ]
 
 [project.urls]
@@ -119,18 +97,55 @@ mast3r-export = "mast3r_runtime.scripts.export:main"
 mast3r-benchmark = "mast3r_runtime.scripts.benchmark:main"
 mast3r-info = "mast3r_runtime.scripts.info:main"
 
-[tool.hatch.build.targets.wheel]
-packages = ["mast3r_runtime"]
+# ============================================================================
+# scikit-build-core configuration
+# ============================================================================
 
-[tool.hatch.build.targets.sdist]
-include = [
-    "mast3r_runtime/**/*.py",
-    "mast3r_runtime/**/*.yaml",
-    "mast3r_runtime/**/*.metal",
-    "README.md",
-    "LICENSE",
-    "NOTICE",
-]
+[tool.scikit-build]
+cmake.build-type = "Release"
+cmake.verbose = false
+wheel.packages = ["mast3r_runtime"]
+
+# Install compiled extensions to backends/
+wheel.install-dir = "mast3r_runtime/backends"
+
+# Minimum CMake version
+cmake.minimum-version = "3.21"
+
+# Build directory
+build-dir = "build/{wheel_tag}"
+
+# ============================================================================
+# Platform-specific CMake configuration
+# ============================================================================
+
+# macOS Apple Silicon - build Metal + CPU
+[[tool.scikit-build.overrides]]
+if.platform-system = "darwin"
+if.platform-machine = "arm64"
+cmake.args = ["-DBUILD_METAL=ON", "-DBUILD_CPU=ON", "-DBUILD_CUDA=OFF", "-DBUILD_JETSON=OFF"]
+
+# macOS Intel - build CPU only
+[[tool.scikit-build.overrides]]
+if.platform-system = "darwin"
+if.platform-machine = "x86_64"
+cmake.args = ["-DBUILD_METAL=OFF", "-DBUILD_CPU=ON", "-DBUILD_CUDA=OFF", "-DBUILD_JETSON=OFF"]
+
+# Linux x86_64 - build CUDA + CPU
+[[tool.scikit-build.overrides]]
+if.platform-system = "linux"
+if.platform-machine = "x86_64"
+cmake.args = ["-DBUILD_METAL=OFF", "-DBUILD_CPU=ON", "-DBUILD_CUDA=ON", "-DBUILD_JETSON=OFF"]
+
+# Linux aarch64 (Jetson) - build Jetson + CUDA
+[[tool.scikit-build.overrides]]
+if.platform-system = "linux"
+if.platform-machine = "aarch64"
+cmake.args = ["-DBUILD_METAL=OFF", "-DBUILD_CPU=ON", "-DBUILD_CUDA=ON", "-DBUILD_JETSON=ON"]
+
+# ============================================================================
+# Ruff configuration
+# ============================================================================
 
 [tool.ruff]
 target-version = "py310"
@@ -143,8 +158,21 @@ ignore = ["B008", "B905", "E501", "N803", "N806"]
 [tool.ruff.lint.isort]
 known-first-party = ["mast3r_runtime"]
 
+# ============================================================================
+# Mypy configuration
+# ============================================================================
+
 [tool.mypy]
 python_version = "3.10"
 warn_return_any = true
 warn_unused_configs = true
 disallow_untyped_defs = true
+
+# ============================================================================
+# Pytest configuration
+# ============================================================================
+
+[tool.pytest.ini_options]
+testpaths = ["tests"]
+python_files = ["test_*.py"]
+addopts = "-v --tb=short"

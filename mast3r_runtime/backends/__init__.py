@@ -1,9 +1,10 @@
 """Backend dispatcher for MASt3R runtime.
 
-Automatically selects the optimal backend based on platform and configuration:
-- ONNX Runtime (default, cross-platform)
-- CoreML (Apple Silicon)
-- TensorRT (NVIDIA Jetson/Linux)
+Automatically selects the best available backend for the current platform:
+- macOS arm64: Metal (Apple Silicon GPU)
+- Linux x86_64: CUDA (NVIDIA GPU)
+- Linux aarch64: Jetson (TensorRT + DLA)
+- Fallback: CPU (C++ with OpenMP/BLAS) or Python (pure numpy)
 
 Copyright 2024 Delanoe Pirard / Aedelon. Apache 2.0.
 """
@@ -14,132 +15,209 @@ import platform
 import sys
 from typing import TYPE_CHECKING
 
-from ..core.config import BackendType
-
 if TYPE_CHECKING:
-    from ..core.config import MASt3RRuntimeConfig
+    from ..core.config import BackendType, MASt3RRuntimeConfig
     from ..core.engine_interface import EngineInterface
 
 
-def is_apple_silicon() -> bool:
-    """Check if running on Apple Silicon."""
-    return sys.platform == "darwin" and platform.machine() == "arm64"
+def get_available_backends() -> dict[str, bool]:
+    """Detect which compiled backends are available.
 
+    Returns:
+        Dict mapping backend name to availability status.
+    """
+    backends = {"python": True}  # Always available
 
-def is_jetson() -> bool:
-    """Check if running on NVIDIA Jetson."""
+    # Try importing compiled extensions
     try:
-        with open("/etc/nv_tegra_release") as f:
-            return "NVIDIA" in f.read()
-    except FileNotFoundError:
-        return False
+        from . import _cpu
 
-
-def is_cuda_available() -> bool:
-    """Check if CUDA is available via onnxruntime-gpu."""
-    try:
-        import onnxruntime as ort
-
-        providers = ort.get_available_providers()
-        return "CUDAExecutionProvider" in providers
+        backends["cpu"] = _cpu.is_available()
     except ImportError:
-        return False
+        backends["cpu"] = False
 
-
-def is_coreml_available() -> bool:
-    """Check if CoreML is available."""
-    if not is_apple_silicon():
-        return False
     try:
-        import onnxruntime as ort
+        from . import _metal
 
-        providers = ort.get_available_providers()
-        return "CoreMLExecutionProvider" in providers
+        backends["metal"] = _metal.is_available()
     except ImportError:
-        return False
+        backends["metal"] = False
+
+    try:
+        from . import _cuda
+
+        backends["cuda"] = _cuda.is_available()
+    except ImportError:
+        backends["cuda"] = False
+
+    try:
+        from . import _jetson
+
+        backends["jetson"] = _jetson.is_available()
+    except ImportError:
+        backends["jetson"] = False
+
+    return backends
 
 
-def get_available_backends() -> list[BackendType]:
-    """Get list of available backends on this system."""
-    available = [BackendType.ONNX]  # Always available with onnxruntime
+def get_best_backend() -> str:
+    """Get the best available backend for the current platform.
 
-    if is_coreml_available():
-        available.append(BackendType.COREML)
+    Returns:
+        Backend name string.
+    """
+    available = get_available_backends()
+    system = platform.system()
+    machine = platform.machine()
 
-    if is_cuda_available():
-        available.append(BackendType.TENSORRT)
+    # macOS arm64 → Metal
+    if system == "Darwin" and machine == "arm64":
+        if available.get("metal"):
+            return "metal"
 
-    return available
+    # Linux x86_64 → CUDA
+    if system == "Linux" and machine == "x86_64":
+        if available.get("cuda"):
+            return "cuda"
+
+    # Linux aarch64 (Jetson) → Jetson > CUDA
+    if system == "Linux" and machine == "aarch64":
+        if available.get("jetson"):
+            return "jetson"
+        if available.get("cuda"):
+            return "cuda"
+
+    # Fallback → CPU → Python
+    if available.get("cpu"):
+        return "cpu"
+
+    return "python"
+
+
+def get_backend_info() -> dict:
+    """Get detailed information about available backends.
+
+    Returns:
+        Dict with platform info and backend details.
+    """
+    available = get_available_backends()
+    best = get_best_backend()
+
+    info = {
+        "platform": {
+            "system": platform.system(),
+            "machine": platform.machine(),
+            "python": sys.version,
+        },
+        "backends": available,
+        "best_backend": best,
+        "details": {},
+    }
+
+    # Get backend-specific details
+    if available.get("metal"):
+        try:
+            from . import _metal
+
+            info["details"]["metal"] = {
+                "device": _metal.get_device_name(),
+                "unified_memory": _metal.has_unified_memory(),
+            }
+        except Exception:
+            pass
+
+    if available.get("cuda"):
+        try:
+            from . import _cuda
+
+            info["details"]["cuda"] = {
+                "device": _cuda.get_device_name(),
+                "compute_capability": _cuda.get_compute_capability(),
+            }
+        except Exception:
+            pass
+
+    return info
 
 
 def get_runtime(config: MASt3RRuntimeConfig) -> EngineInterface:
-    """Get the appropriate runtime engine based on configuration.
-
-    This is the main entry point for getting an inference engine.
+    """Get runtime engine based on config and platform.
 
     Args:
-        config: Runtime configuration
+        config: Runtime configuration.
 
     Returns:
-        Initialized engine ready for inference
+        EngineInterface instance for the selected backend.
 
     Raises:
-        ImportError: If required backend dependencies are missing
-        ValueError: If requested backend is not available
-
-    Example:
-        >>> from mast3r_runtime import get_runtime, MASt3RRuntimeConfig
-        >>> config = MASt3RRuntimeConfig()
-        >>> with get_runtime(config) as engine:
-        ...     result = engine.infer(img1, img2)
+        RuntimeError: If no suitable backend is available.
     """
-    backend_type = config.runtime.backend
+    from ..core.config import BackendType
 
-    # Auto-select based on platform
-    if backend_type == BackendType.AUTO:
-        if is_apple_silicon() and is_coreml_available():
-            backend_type = BackendType.COREML
-        elif is_cuda_available():
-            backend_type = BackendType.ONNX  # ONNX with CUDA provider
-        else:
-            backend_type = BackendType.ONNX
+    backend = config.runtime.backend
 
-    # ONNX backend (default, handles CUDA/CoreML via execution providers)
-    if backend_type in (BackendType.ONNX, BackendType.COREML, BackendType.TENSORRT):
+    if backend == BackendType.AUTO:
+        backend_name = get_best_backend()
+    else:
+        backend_name = backend.value
+
+    # Import and return the appropriate engine
+    if backend_name == "metal":
         try:
-            from .onnx import ONNXEngine
+            from ._metal import MetalEngine
 
-            return ONNXEngine(config)
+            return _create_native_engine(MetalEngine, config)
         except ImportError as e:
-            msg = f"ONNX Runtime not available: {e}\nInstall with: pip install mast3r-runtime[onnx]"
-            raise ImportError(msg) from e
+            raise RuntimeError(f"Metal backend not available: {e}") from e
 
-    # PyTorch backend (requires external mast3r package)
-    if backend_type == BackendType.PYTORCH:
-        msg = (
-            "PyTorch backend requires MASt3R installed separately.\n"
-            "This is not included in mast3r-runtime due to licensing.\n"
-            "Install MASt3R from: https://github.com/naver/mast3r"
-        )
-        raise ImportError(msg)
+    elif backend_name == "cuda":
+        try:
+            from ._cuda import CUDAEngine
 
-    msg = f"Unknown backend type: {backend_type}"
-    raise ValueError(msg)
+            return _create_native_engine(CUDAEngine, config)
+        except ImportError as e:
+            raise RuntimeError(f"CUDA backend not available: {e}") from e
+
+    elif backend_name == "jetson":
+        try:
+            from ._jetson import JetsonEngine
+
+            return _create_native_engine(JetsonEngine, config)
+        except ImportError as e:
+            raise RuntimeError(f"Jetson backend not available: {e}") from e
+
+    elif backend_name == "cpu":
+        try:
+            from ._cpu import CPUEngine
+
+            return _create_native_engine(CPUEngine, config)
+        except ImportError as e:
+            raise RuntimeError(f"CPU backend not available: {e}") from e
+
+    else:
+        # Python fallback
+        from .python.python_engine import PythonEngine
+
+        return PythonEngine(config)
 
 
-# Convenience aliases
-get_engine = get_runtime
-get_backend = get_runtime
+def _create_native_engine(engine_class, config: MASt3RRuntimeConfig):
+    """Create a native engine from pybind11 class with Python wrapper."""
+    from .native_wrapper import NativeEngineWrapper
+
+    native = engine_class(
+        variant=config.model.variant.value,
+        resolution=config.model.resolution,
+        precision=config.model.precision.value,
+        num_threads=config.runtime.num_threads,
+    )
+
+    return NativeEngineWrapper(native, config)
 
 
 __all__ = [
-    "BackendType",
     "get_available_backends",
-    "get_backend",
-    "get_engine",
+    "get_backend_info",
+    "get_best_backend",
     "get_runtime",
-    "is_apple_silicon",
-    "is_coreml_available",
-    "is_cuda_available",
-    "is_jetson",
 ]

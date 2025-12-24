@@ -30,10 +30,11 @@ class BackendType(str, Enum):
     """Runtime backend types."""
 
     AUTO = "auto"
-    ONNX = "onnx"
-    COREML = "coreml"
-    TENSORRT = "tensorrt"
-    PYTORCH = "pytorch"  # Requires mast3r installed separately
+    CPU = "cpu"  # C++ with OpenMP/BLAS
+    METAL = "metal"  # Apple Silicon (Metal + MPSGraph)
+    CUDA = "cuda"  # NVIDIA GPU (cuBLAS + custom kernels)
+    JETSON = "jetson"  # NVIDIA Jetson (TensorRT + DLA)
+    PYTHON = "python"  # Pure Python/numpy fallback
 
 
 class Precision(str, Enum):
@@ -295,7 +296,7 @@ PRESET_DESKTOP_PRECISION = MASt3RRuntimeConfig(
         precision=Precision.FP32,
     ),
     runtime=RuntimeConfig(
-        backend=BackendType.PYTORCH,
+        backend=BackendType.PYTHON,
         use_dual_resolution=False,
     ),
     matching=MatchingConfig(
@@ -303,3 +304,27 @@ PRESET_DESKTOP_PRECISION = MASt3RRuntimeConfig(
         reciprocal=True,
     ),
 )
+
+
+def get_default_model_path(
+    variant: ModelVariant,
+    precision: Precision = Precision.FP16,
+    cache_dir: Path | None = None,
+) -> Path:
+    """Get default path for model weights.
+
+    Args:
+        variant: Model variant.
+        precision: Model precision.
+        cache_dir: Optional cache directory. Uses ~/.cache/mast3r_runtime if None.
+
+    Returns:
+        Path to model weights file (may not exist yet).
+    """
+    if cache_dir is None:
+        cache_dir = Path.home() / ".cache" / "mast3r_runtime"
+
+    models_dir = cache_dir / "models"
+    filename = f"{variant.value}_{precision.value}.safetensors"
+
+    return models_dir / filename

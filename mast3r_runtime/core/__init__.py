@@ -15,6 +15,7 @@ from .config import (
     ModelVariant,
     Precision,
     RuntimeConfig,
+    get_default_model_path,
 )
 from .engine_interface import (
     EngineInterface,
@@ -48,6 +49,7 @@ __all__ = [
     "ModelVariant",
     "Precision",
     "RuntimeConfig",
+    "get_default_model_path",
     # Engine
     "EngineInterface",
     "InferenceResult",
