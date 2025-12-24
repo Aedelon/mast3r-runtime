@@ -1,9 +1,9 @@
 """Configuration for MASt3R embedded runtime.
 
 Supports multiple model variants:
-- DUNE-MASt3R ViT-Small/14 (~280MB) - Fastest, for real-time drone
-- DUNE-MASt3R ViT-Base/14 (~650MB) - Balance quality/speed
-- MASt3R ViT-Large (1.2GB) - Maximum precision
+- DUNE-MASt3R ViT-Small/14 (~1.3GB) - Fastest, for real-time drone
+- DUNE-MASt3R ViT-Base/14 (~1.7GB) - Balance quality/speed
+- MASt3R ViT-Large (~2.6GB) - Maximum precision
 
 Copyright 2024 Delanoe Pirard / Aedelon. Apache 2.0.
 """
@@ -63,12 +63,12 @@ MODEL_SPECS: dict[ModelVariant, dict] = {
             "encoder": {
                 "url": f"{NAVER_CDN_BASE}/dune/dune_vitsmall14_448.pth",
                 "filename": "dune_vitsmall14_448.pth",
-                "size_mb": 110,
+                "size_mb": 109,
             },
             "decoder": {
                 "url": f"{NAVER_CDN_BASE}/dune/dunemast3r_cvpr25_vitsmall.pth",
                 "filename": "dunemast3r_cvpr25_vitsmall.pth",
-                "size_mb": 170,
+                "size_mb": 1234,
             },
         },
     },
@@ -89,7 +89,7 @@ MODEL_SPECS: dict[ModelVariant, dict] = {
             "decoder": {
                 "url": f"{NAVER_CDN_BASE}/dune/dunemast3r_cvpr25_vitbase.pth",
                 "filename": "dunemast3r_cvpr25_vitbase.pth",
-                "size_mb": 230,
+                "size_mb": 1325,
             },
         },
     },
@@ -105,7 +105,7 @@ MODEL_SPECS: dict[ModelVariant, dict] = {
             "unified": {
                 "url": f"{NAVER_CDN_BASE}/ComputerVision/MASt3R/MASt3R_ViTLarge_BaseDecoder_512_catmlpdpt_metric.pth",
                 "filename": "MASt3R_ViTLarge_BaseDecoder_512_catmlpdpt_metric.pth",
-                "size_mb": 1200,
+                "size_mb": 2627,
             },
         },
     },
