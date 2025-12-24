@@ -48,39 +48,66 @@ class Precision(str, Enum):
 NAVER_CDN_BASE = "https://download.europe.naverlabs.com"
 
 # Model specifications
+# DUNE models require both encoder and decoder checkpoints
+# MASt3R ViT-Large is a single unified checkpoint
 MODEL_SPECS: dict[ModelVariant, dict] = {
     ModelVariant.DUNE_VIT_SMALL_14: {
-        "encoder": "vit_small_patch14_dinov2",
+        "encoder_arch": "vit_small_patch14_dinov2",
+        "decoder_arch": "vit_base_decoder",
         "patch_size": 14,
         "embed_dim": 384,
         "num_heads": 6,
         "depth": 12,
         "native_resolution": 448,
-        "checkpoint_size_mb": 280,
-        "download_url": f"{NAVER_CDN_BASE}/dune/dunemast3r_cvpr25_vitsmall.pth",
-        "checkpoint_name": "dunemast3r_cvpr25_vitsmall.pth",
+        "checkpoints": {
+            "encoder": {
+                "url": f"{NAVER_CDN_BASE}/dune/dune_vitsmall14_448.pth",
+                "filename": "dune_vitsmall14_448.pth",
+                "size_mb": 110,
+            },
+            "decoder": {
+                "url": f"{NAVER_CDN_BASE}/dune/dunemast3r_cvpr25_vitsmall.pth",
+                "filename": "dunemast3r_cvpr25_vitsmall.pth",
+                "size_mb": 170,
+            },
+        },
     },
     ModelVariant.DUNE_VIT_BASE_14: {
-        "encoder": "vit_base_patch14_dinov2",
+        "encoder_arch": "vit_base_patch14_dinov2",
+        "decoder_arch": "vit_base_decoder",
         "patch_size": 14,
         "embed_dim": 768,
         "num_heads": 12,
         "depth": 12,
         "native_resolution": 448,
-        "checkpoint_size_mb": 650,
-        "download_url": f"{NAVER_CDN_BASE}/dune/dunemast3r_cvpr25_vitbase.pth",
-        "checkpoint_name": "dunemast3r_cvpr25_vitbase.pth",
+        "checkpoints": {
+            "encoder": {
+                "url": f"{NAVER_CDN_BASE}/dune/dune_vitbase14_448.pth",
+                "filename": "dune_vitbase14_448.pth",
+                "size_mb": 420,
+            },
+            "decoder": {
+                "url": f"{NAVER_CDN_BASE}/dune/dunemast3r_cvpr25_vitbase.pth",
+                "filename": "dunemast3r_cvpr25_vitbase.pth",
+                "size_mb": 230,
+            },
+        },
     },
     ModelVariant.MAST3R_VIT_LARGE: {
-        "encoder": "vit_large_patch14_dinov2",
+        "encoder_arch": "vit_large_patch14_dinov2",
+        "decoder_arch": "vit_base_decoder",
         "patch_size": 14,
         "embed_dim": 1024,
         "num_heads": 16,
         "depth": 24,
         "native_resolution": 512,
-        "checkpoint_size_mb": 1200,
-        "download_url": "https://huggingface.co/naver/MASt3R_ViTLarge_BaseDecoder_512_catmlpdpt_metric/resolve/main/MASt3R_ViTLarge_BaseDecoder_512_catmlpdpt_metric.pth",
-        "checkpoint_name": "MASt3R_ViTLarge_BaseDecoder_512_catmlpdpt_metric.pth",
+        "checkpoints": {
+            "unified": {
+                "url": f"{NAVER_CDN_BASE}/ComputerVision/MASt3R/MASt3R_ViTLarge_BaseDecoder_512_catmlpdpt_metric.pth",
+                "filename": "MASt3R_ViTLarge_BaseDecoder_512_catmlpdpt_metric.pth",
+                "size_mb": 1200,
+            },
+        },
     },
 }
 
@@ -296,25 +323,58 @@ PRESET_DESKTOP_PRECISION = MASt3RRuntimeConfig(
 )
 
 
-def get_default_model_path(
+def get_checkpoint_paths(
     variant: ModelVariant,
-    precision: Precision = Precision.FP16,
     cache_dir: Path | None = None,
-) -> Path:
-    """Get default path for model weights.
+) -> dict[str, Path]:
+    """Get paths for model checkpoints.
 
     Args:
         variant: Model variant.
-        precision: Model precision.
         cache_dir: Optional cache directory. Uses ~/.cache/mast3r_runtime if None.
 
     Returns:
-        Path to model weights file (may not exist yet).
+        Dict mapping checkpoint type to path.
+        - DUNE models: {"encoder": Path, "decoder": Path}
+        - MASt3R: {"unified": Path}
     """
     if cache_dir is None:
         cache_dir = Path.home() / ".cache" / "mast3r_runtime"
 
-    models_dir = cache_dir / "models"
-    filename = f"{variant.value}_{precision.value}.safetensors"
+    models_dir = cache_dir / "checkpoints"
+    spec = MODEL_SPECS[variant]
 
-    return models_dir / filename
+    paths = {}
+    for ckpt_type, ckpt_info in spec["checkpoints"].items():
+        paths[ckpt_type] = models_dir / ckpt_info["filename"]
+
+    return paths
+
+
+def get_checkpoint_urls(variant: ModelVariant) -> dict[str, str]:
+    """Get download URLs for model checkpoints.
+
+    Args:
+        variant: Model variant.
+
+    Returns:
+        Dict mapping checkpoint type to download URL.
+    """
+    spec = MODEL_SPECS[variant]
+    return {
+        ckpt_type: ckpt_info["url"]
+        for ckpt_type, ckpt_info in spec["checkpoints"].items()
+    }
+
+
+def get_total_checkpoint_size_mb(variant: ModelVariant) -> int:
+    """Get total size of all checkpoints for a variant.
+
+    Args:
+        variant: Model variant.
+
+    Returns:
+        Total size in MB.
+    """
+    spec = MODEL_SPECS[variant]
+    return sum(ckpt_info["size_mb"] for ckpt_info in spec["checkpoints"].values())

@@ -5,6 +5,7 @@ Copyright 2024 Delanoe Pirard / Aedelon. Apache 2.0.
 
 from .config import (
     MODEL_SPECS,
+    NAVER_CDN_BASE,
     PRESET_DESKTOP_PRECISION,
     PRESET_DRONE_FAST,
     PRESET_DRONE_QUALITY,
@@ -15,7 +16,9 @@ from .config import (
     ModelVariant,
     Precision,
     RuntimeConfig,
-    get_default_model_path,
+    get_checkpoint_paths,
+    get_checkpoint_urls,
+    get_total_checkpoint_size_mb,
 )
 from .engine_interface import (
     EngineInterface,
@@ -39,6 +42,7 @@ __all__ = [
     "prepare_image_numpy",
     # Config
     "MODEL_SPECS",
+    "NAVER_CDN_BASE",
     "PRESET_DESKTOP_PRECISION",
     "PRESET_DRONE_FAST",
     "PRESET_DRONE_QUALITY",
@@ -49,7 +53,9 @@ __all__ = [
     "ModelVariant",
     "Precision",
     "RuntimeConfig",
-    "get_default_model_path",
+    "get_checkpoint_paths",
+    "get_checkpoint_urls",
+    "get_total_checkpoint_size_mb",
     # Engine
     "EngineInterface",
     "InferenceResult",
