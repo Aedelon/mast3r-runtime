@@ -1,0 +1,150 @@
+[build-system]
+build-backend = "hatchling.build"
+requires = ["hatchling"]
+
+[project]
+name = "mast3r-runtime"
+version = "0.1.0"
+description = "Optimized inference runtime for MASt3R/DUNE 3D vision models on embedded platforms"
+readme = "README.md"
+license = "Apache-2.0"
+authors = [{ name = "Delanoe Pirard", email = "delanoe@aedelon.com" }]
+maintainers = [{ name = "Delanoe Pirard", email = "delanoe@aedelon.com" }]
+requires-python = ">=3.10"
+
+keywords = [
+    "mast3r",
+    "dune",
+    "dust3r",
+    "3d-vision",
+    "stereo-matching",
+    "depth-estimation",
+    "slam",
+    "robotics",
+    "drone",
+    "embedded",
+    "coreml",
+    "tensorrt",
+    "onnx",
+    "inference",
+]
+
+classifiers = [
+    "Development Status :: 4 - Beta",
+    "Intended Audience :: Developers",
+    "Intended Audience :: Science/Research",
+    "License :: OSI Approved :: Apache Software License",
+    "Operating System :: OS Independent",
+    "Programming Language :: Python :: 3",
+    "Programming Language :: Python :: 3.10",
+    "Programming Language :: Python :: 3.11",
+    "Programming Language :: Python :: 3.12",
+    "Programming Language :: Python :: 3.13",
+    "Topic :: Scientific/Engineering :: Artificial Intelligence",
+    "Topic :: Scientific/Engineering :: Image Processing",
+    "Topic :: Scientific/Engineering :: Image Recognition",
+    "Typing :: Typed",
+]
+
+# Minimal dependencies for core functionality
+dependencies = [
+    "numpy>=1.24",
+    "pillow>=10.0",
+    "pydantic>=2.0",
+    "pyyaml>=6.0",
+    "tqdm>=4.60",
+    "huggingface-hub>=0.20",
+]
+
+[project.optional-dependencies]
+# ONNX Runtime - lightweight inference (recommended)
+onnx = [
+    "onnxruntime>=1.17",
+]
+
+# ONNX with GPU support (CUDA)
+onnx-gpu = [
+    "onnxruntime-gpu>=1.17",
+]
+
+# CUDA support (PyTorch with CUDA)
+cuda = [
+    "torch>=2.0",
+    "onnxruntime-gpu>=1.17",
+]
+
+# CoreML backend (Apple Silicon - macOS only)
+coreml = [
+    "coremltools>=7.0; sys_platform == 'darwin'",
+]
+
+# TensorRT backend (NVIDIA - Linux/Jetson only)
+tensorrt = [
+    "tensorrt>=8.6; sys_platform == 'linux'",
+    "cuda-python>=12.0; sys_platform == 'linux'",
+]
+
+# Export tools (requires PyTorch + MASt3R)
+export = [
+    "torch>=2.0",
+    "torchvision>=0.15",
+    "onnx>=1.15",
+    "onnxscript>=0.1",
+]
+
+# Development
+dev = [
+    "pytest>=8.0",
+    "pytest-cov>=4.0",
+    "ruff>=0.1",
+    "mypy>=1.8",
+    "pre-commit>=3.0",
+]
+
+# All inference backends
+all = [
+    "mast3r-runtime[onnx,coreml,cuda]",
+]
+
+[project.urls]
+Homepage = "https://github.com/aedelon/mast3r-runtime"
+Documentation = "https://github.com/aedelon/mast3r-runtime#readme"
+Repository = "https://github.com/aedelon/mast3r-runtime"
+Issues = "https://github.com/aedelon/mast3r-runtime/issues"
+Changelog = "https://github.com/aedelon/mast3r-runtime/blob/main/CHANGELOG.md"
+
+[project.scripts]
+mast3r-download = "mast3r_runtime.scripts.download:main"
+mast3r-export = "mast3r_runtime.scripts.export:main"
+mast3r-benchmark = "mast3r_runtime.scripts.benchmark:main"
+mast3r-info = "mast3r_runtime.scripts.info:main"
+
+[tool.hatch.build.targets.wheel]
+packages = ["mast3r_runtime"]
+
+[tool.hatch.build.targets.sdist]
+include = [
+    "mast3r_runtime/**/*.py",
+    "mast3r_runtime/**/*.yaml",
+    "mast3r_runtime/**/*.metal",
+    "README.md",
+    "LICENSE",
+    "NOTICE",
+]
+
+[tool.ruff]
+target-version = "py310"
+line-length = 100
+
+[tool.ruff.lint]
+select = ["B", "C4", "E", "F", "I", "N", "RUF", "SIM", "UP", "W"]
+ignore = ["B008", "B905", "E501", "N803", "N806"]
+
+[tool.ruff.lint.isort]
+known-first-party = ["mast3r_runtime"]
+
+[tool.mypy]
+python_version = "3.10"
+warn_return_any = true
+warn_unused_configs = true
+disallow_untyped_defs = true

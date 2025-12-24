@@ -1,0 +1,52 @@
+MASt3R Runtime
+Copyright 2024 Delanoe Pirard / Aedelon
+
+This product includes software developed by Delanoe Pirard (Aedelon).
+
+================================================================================
+
+THIRD-PARTY MODEL WEIGHTS NOTICE
+
+This runtime is designed to work with model weights from MASt3R and DUNE,
+developed by Naver Corporation. These model weights are NOT included in
+this package and must be downloaded separately.
+
+The model weights are licensed under:
+    Creative Commons Attribution-NonCommercial-ShareAlike 4.0 International
+    (CC BY-NC-SA 4.0)
+
+This means the model weights:
+- May NOT be used for commercial purposes without permission from Naver
+- Must retain attribution to the original authors
+- Any derivative works must use the same license
+
+For commercial licensing of the model weights, contact Naver Corporation.
+
+References:
+- MASt3R: https://github.com/naver/mast3r
+- DUNE: https://github.com/naver/dune
+- DUSt3R: https://github.com/naver/dust3r
+
+If you use these models in research, please cite:
+
+@inproceedings{leroy2024mast3r,
+    title={Grounding Image Matching in 3D with MASt3R},
+    author={Leroy, Vincent and Cabon, Yohann and Revaud, J{\'e}r{\^o}me},
+    booktitle={ECCV},
+    year={2024}
+}
+
+@inproceedings{wang2024dust3r,
+    title={DUSt3R: Geometric 3D Vision Made Easy},
+    author={Wang, Shuzhe and Leroy, Vincent and Cabon, Yohann and
+            Chidlovskii, Boris and Revaud, J{\'e}r{\^o}me},
+    booktitle={CVPR},
+    year={2024}
+}
+
+================================================================================
+
+RUNTIME CODE LICENSE
+
+The mast3r-runtime package code (excluding model weights) is licensed under
+the Apache License, Version 2.0. See LICENSE file for details.
