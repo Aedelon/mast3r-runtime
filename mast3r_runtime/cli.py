@@ -10,6 +10,7 @@ import sys
 from pathlib import Path
 
 from .core.config import ModelVariant
+from .utils.convert import convert_all_models, convert_model
 from .utils.downloader import (
     DownloadError,
     download_all_models,
@@ -54,6 +55,36 @@ def cmd_status(args: argparse.Namespace) -> int:
     return 0
 
 
+def cmd_convert(args: argparse.Namespace) -> int:
+    """Convert checkpoints to safetensors."""
+    cache_dir = Path(args.cache_dir) if args.cache_dir else None
+    output_dir = Path(args.output) if args.output else None
+
+    try:
+        if args.model == "all":
+            convert_all_models(
+                cache_dir=cache_dir,
+                output_dir=output_dir,
+                dtype=args.dtype,
+            )
+        else:
+            variant = ModelVariant(args.model)
+            convert_model(
+                variant,
+                cache_dir=cache_dir,
+                output_dir=output_dir,
+                dtype=args.dtype,
+            )
+        return 0
+
+    except ImportError as e:
+        print(f"Error: {e}", file=sys.stderr)
+        return 1
+    except Exception as e:
+        print(f"Error: {e}", file=sys.stderr)
+        return 1
+
+
 def main() -> int:
     """Main CLI entry point."""
     parser = argparse.ArgumentParser(
@@ -92,6 +123,26 @@ def main() -> int:
     # Status command
     status_parser = subparsers.add_parser("status", help="Show download status")
     status_parser.set_defaults(func=cmd_status)
+
+    # Convert command
+    conv_parser = subparsers.add_parser("convert", help="Convert to safetensors")
+    conv_parser.add_argument(
+        "model",
+        choices=["all"] + [v.value for v in ModelVariant],
+        help="Model to convert (or 'all')",
+    )
+    conv_parser.add_argument(
+        "--output",
+        "-o",
+        help="Output directory",
+    )
+    conv_parser.add_argument(
+        "--dtype",
+        choices=["fp32", "fp16", "bf16"],
+        default="fp16",
+        help="Target dtype (default: fp16)",
+    )
+    conv_parser.set_defaults(func=cmd_convert)
 
     args = parser.parse_args()
 
