@@ -1,10 +1,9 @@
 """Configuration for MASt3R embedded runtime.
 
 Supports multiple model variants:
-- DUNE ViT-Small/14 (110MB) - Fastest, for real-time drone
-- DUNE ViT-Base/14 (420MB) - Balance quality/speed
+- DUNE-MASt3R ViT-Small/14 (~280MB) - Fastest, for real-time drone
+- DUNE-MASt3R ViT-Base/14 (~650MB) - Balance quality/speed
 - MASt3R ViT-Large (1.2GB) - Maximum precision
-- DUSt3R 224 linear (~800MB) - Legacy compatibility
 
 Copyright 2024 Delanoe Pirard / Aedelon. Apache 2.0.
 """
@@ -23,7 +22,6 @@ class ModelVariant(str, Enum):
     DUNE_VIT_SMALL_14 = "dune_vit_small_14"
     DUNE_VIT_BASE_14 = "dune_vit_base_14"
     MAST3R_VIT_LARGE = "mast3r_vit_large"
-    DUST3R_224_LINEAR = "dust3r_224_linear"
 
 
 class BackendType(str, Enum):
@@ -46,6 +44,9 @@ class Precision(str, Enum):
     INT4 = "int4"  # CoreML palettization
 
 
+# Base URL for DUNE/MASt3R checkpoints
+NAVER_CDN_BASE = "https://download.europe.naverlabs.com"
+
 # Model specifications
 MODEL_SPECS: dict[ModelVariant, dict] = {
     ModelVariant.DUNE_VIT_SMALL_14: {
@@ -54,10 +55,10 @@ MODEL_SPECS: dict[ModelVariant, dict] = {
         "embed_dim": 384,
         "num_heads": 6,
         "depth": 12,
-        "native_resolution": 336,
-        "checkpoint_size_mb": 110,
-        "hf_repo": "naver/DUNE",
-        "checkpoint_name": "dune_vit_small_14.pth",
+        "native_resolution": 448,
+        "checkpoint_size_mb": 280,
+        "download_url": f"{NAVER_CDN_BASE}/dune/dunemast3r_cvpr25_vitsmall.pth",
+        "checkpoint_name": "dunemast3r_cvpr25_vitsmall.pth",
     },
     ModelVariant.DUNE_VIT_BASE_14: {
         "encoder": "vit_base_patch14_dinov2",
@@ -65,10 +66,10 @@ MODEL_SPECS: dict[ModelVariant, dict] = {
         "embed_dim": 768,
         "num_heads": 12,
         "depth": 12,
-        "native_resolution": 336,
-        "checkpoint_size_mb": 420,
-        "hf_repo": "naver/DUNE",
-        "checkpoint_name": "dune_vit_base_14.pth",
+        "native_resolution": 448,
+        "checkpoint_size_mb": 650,
+        "download_url": f"{NAVER_CDN_BASE}/dune/dunemast3r_cvpr25_vitbase.pth",
+        "checkpoint_name": "dunemast3r_cvpr25_vitbase.pth",
     },
     ModelVariant.MAST3R_VIT_LARGE: {
         "encoder": "vit_large_patch14_dinov2",
@@ -78,19 +79,8 @@ MODEL_SPECS: dict[ModelVariant, dict] = {
         "depth": 24,
         "native_resolution": 512,
         "checkpoint_size_mb": 1200,
-        "hf_repo": "naver/MASt3R_ViTLarge_BaseDecoder_512_catmlpdpt_metric",
+        "download_url": "https://huggingface.co/naver/MASt3R_ViTLarge_BaseDecoder_512_catmlpdpt_metric/resolve/main/MASt3R_ViTLarge_BaseDecoder_512_catmlpdpt_metric.pth",
         "checkpoint_name": "MASt3R_ViTLarge_BaseDecoder_512_catmlpdpt_metric.pth",
-    },
-    ModelVariant.DUST3R_224_LINEAR: {
-        "encoder": "vit_large_patch14_dinov2",
-        "patch_size": 14,
-        "embed_dim": 1024,
-        "num_heads": 16,
-        "depth": 24,
-        "native_resolution": 224,
-        "checkpoint_size_mb": 800,
-        "hf_repo": "naver/DUSt3R_ViTLarge_BaseDecoder_224_linear",
-        "checkpoint_name": "DUSt3R_ViTLarge_BaseDecoder_224_linear.pth",
     },
 }
 
@@ -103,7 +93,7 @@ class ModelConfig(BaseModel):
         description="Model variant to use",
     )
     resolution: int = Field(
-        default=336,
+        default=448,
         ge=224,
         le=560,  # Max 560 = 14 * 40
         description="Input resolution (must be divisible by patch_size)",
@@ -256,14 +246,14 @@ class MASt3RRuntimeConfig(BaseModel):
 PRESET_DRONE_FAST = MASt3RRuntimeConfig(
     model=ModelConfig(
         variant=ModelVariant.DUNE_VIT_SMALL_14,
-        resolution=336,
+        resolution=448,
         precision=Precision.FP16,
     ),
     runtime=RuntimeConfig(
         backend=BackendType.AUTO,
         use_dual_resolution=True,
-        tracking_resolution=256,
-        keyframe_resolution=336,
+        tracking_resolution=224,
+        keyframe_resolution=448,
     ),
     matching=MatchingConfig(
         top_k=512,
@@ -274,13 +264,13 @@ PRESET_DRONE_FAST = MASt3RRuntimeConfig(
 PRESET_DRONE_QUALITY = MASt3RRuntimeConfig(
     model=ModelConfig(
         variant=ModelVariant.DUNE_VIT_BASE_14,
-        resolution=336,
+        resolution=448,
         precision=Precision.FP16,
     ),
     runtime=RuntimeConfig(
         backend=BackendType.AUTO,
         use_dual_resolution=True,
-        tracking_resolution=256,
+        tracking_resolution=224,
         keyframe_resolution=448,
     ),
     matching=MatchingConfig(
