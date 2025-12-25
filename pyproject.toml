@@ -2,8 +2,8 @@
 # Copyright 2024 Delanoe Pirard / Aedelon. Apache 2.0.
 
 [build-system]
-requires = ["scikit-build-core>=0.10", "pybind11>=2.12"]
-build-backend = "scikit_build_core.build"
+requires = ["hatchling"]
+build-backend = "hatchling.build"
 
 [project]
 name = "mast3r-runtime"
@@ -37,7 +37,6 @@ classifiers = [
     "Development Status :: 4 - Beta",
     "Intended Audience :: Developers",
     "Intended Audience :: Science/Research",
-    "License :: OSI Approved :: Apache Software License",
     "Operating System :: MacOS :: MacOS X",
     "Operating System :: POSIX :: Linux",
     "Programming Language :: C++",
@@ -93,50 +92,14 @@ Changelog = "https://github.com/aedelon/mast3r-runtime/blob/main/CHANGELOG.md"
 mast3r-runtime = "mast3r_runtime.cli:main"
 
 # ============================================================================
-# scikit-build-core configuration
+# Hatch build configuration (pure Python for now)
 # ============================================================================
 
-[tool.scikit-build]
-cmake.build-type = "Release"
-cmake.verbose = false
-wheel.packages = ["mast3r_runtime"]
+[tool.hatch.build.targets.wheel]
+packages = ["mast3r_runtime"]
 
-# Install compiled extensions to backends/
-wheel.install-dir = "mast3r_runtime/backends"
-
-# Minimum CMake version
-cmake.minimum-version = "3.21"
-
-# Build directory
-build-dir = "build/{wheel_tag}"
-
-# ============================================================================
-# Platform-specific CMake configuration
-# ============================================================================
-
-# macOS Apple Silicon - build Metal + CPU
-[[tool.scikit-build.overrides]]
-if.platform-system = "darwin"
-if.platform-machine = "arm64"
-cmake.args = ["-DBUILD_METAL=ON", "-DBUILD_CPU=ON", "-DBUILD_CUDA=OFF", "-DBUILD_JETSON=OFF"]
-
-# macOS Intel - build CPU only
-[[tool.scikit-build.overrides]]
-if.platform-system = "darwin"
-if.platform-machine = "x86_64"
-cmake.args = ["-DBUILD_METAL=OFF", "-DBUILD_CPU=ON", "-DBUILD_CUDA=OFF", "-DBUILD_JETSON=OFF"]
-
-# Linux x86_64 - build CUDA + CPU
-[[tool.scikit-build.overrides]]
-if.platform-system = "linux"
-if.platform-machine = "x86_64"
-cmake.args = ["-DBUILD_METAL=OFF", "-DBUILD_CPU=ON", "-DBUILD_CUDA=ON", "-DBUILD_JETSON=OFF"]
-
-# Linux aarch64 (Jetson) - build Jetson + CUDA
-[[tool.scikit-build.overrides]]
-if.platform-system = "linux"
-if.platform-machine = "aarch64"
-cmake.args = ["-DBUILD_METAL=OFF", "-DBUILD_CPU=ON", "-DBUILD_CUDA=ON", "-DBUILD_JETSON=ON"]
+# Note: C++ backends will be added later with scikit-build-core
+# For now, using Python fallback backend only
 
 # ============================================================================
 # Ruff configuration
