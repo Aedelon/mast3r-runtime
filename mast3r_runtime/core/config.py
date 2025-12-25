@@ -19,9 +19,13 @@ from pydantic import BaseModel, Field, model_validator
 class ModelVariant(str, Enum):
     """Supported model variants."""
 
-    DUNE_VIT_SMALL_14 = "dune_vit_small_14"
-    DUNE_VIT_BASE_14 = "dune_vit_base_14"
-    MAST3R_VIT_LARGE = "mast3r_vit_large"
+    # DUNE models (encoder + decoder checkpoints)
+    DUNE_VIT_SMALL_336 = "dune_vit_small_336"  # Fastest, lower res
+    DUNE_VIT_SMALL_448 = "dune_vit_small_448"  # Fast, standard res
+    DUNE_VIT_BASE_336 = "dune_vit_base_336"    # Balanced, lower res
+    DUNE_VIT_BASE_448 = "dune_vit_base_448"    # Balanced, standard res
+    # MASt3R (unified checkpoint)
+    MAST3R_VIT_LARGE = "mast3r_vit_large"      # Maximum precision
 
 
 class BackendType(str, Enum):
@@ -47,11 +51,47 @@ class Precision(str, Enum):
 # Base URL for DUNE/MASt3R checkpoints
 NAVER_CDN_BASE = "https://download.europe.naverlabs.com"
 
+# HuggingFace repos for pre-converted safetensors (FP16)
+HF_REPO_DUNE = "Aedelon/dunemast3r-models-fp16"
+HF_REPO_MAST3R = "Aedelon/mast3r-vit-large-fp16"
+
+
+class DownloadSource(str, Enum):
+    """Download source for checkpoints."""
+
+    AUTO = "auto"      # Try HF first, fallback to Naver
+    NAVER = "naver"    # Official Naver CDN (.pth)
+    HF = "hf"          # HuggingFace (.safetensors)
+
 # Model specifications
 # DUNE models require both encoder and decoder checkpoints
 # MASt3R ViT-Large is a single unified checkpoint
 MODEL_SPECS: dict[ModelVariant, dict] = {
-    ModelVariant.DUNE_VIT_SMALL_14: {
+    ModelVariant.DUNE_VIT_SMALL_336: {
+        "encoder_arch": "vit_small_patch14_dinov2",
+        "decoder_arch": "vit_base_decoder",
+        "patch_size": 14,
+        "embed_dim": 384,
+        "num_heads": 6,
+        "depth": 12,
+        "native_resolution": 336,
+        "hf_repo": HF_REPO_DUNE,
+        "checkpoints": {
+            "encoder": {
+                "url": f"{NAVER_CDN_BASE}/dune/dune_vitsmall14_336.pth",
+                "filename": "dune_vitsmall14_336.pth",
+                "hf_filename": "dune_vit_small_336/encoder.safetensors",
+                "size_mb": 109,
+            },
+            "decoder": {
+                "url": f"{NAVER_CDN_BASE}/dune/dunemast3r_cvpr25_vitsmall.pth",
+                "filename": "dunemast3r_cvpr25_vitsmall.pth",
+                "hf_filename": "dune_vit_small_336/decoder.safetensors",
+                "size_mb": 1234,
+            },
+        },
+    },
+    ModelVariant.DUNE_VIT_SMALL_448: {
         "encoder_arch": "vit_small_patch14_dinov2",
         "decoder_arch": "vit_base_decoder",
         "patch_size": 14,
@@ -59,20 +99,47 @@ MODEL_SPECS: dict[ModelVariant, dict] = {
         "num_heads": 6,
         "depth": 12,
         "native_resolution": 448,
+        "hf_repo": HF_REPO_DUNE,
         "checkpoints": {
             "encoder": {
                 "url": f"{NAVER_CDN_BASE}/dune/dune_vitsmall14_448.pth",
                 "filename": "dune_vitsmall14_448.pth",
+                "hf_filename": "dune_vit_small_448/encoder.safetensors",
                 "size_mb": 109,
             },
             "decoder": {
                 "url": f"{NAVER_CDN_BASE}/dune/dunemast3r_cvpr25_vitsmall.pth",
                 "filename": "dunemast3r_cvpr25_vitsmall.pth",
+                "hf_filename": "dune_vit_small_448/decoder.safetensors",
                 "size_mb": 1234,
             },
         },
     },
-    ModelVariant.DUNE_VIT_BASE_14: {
+    ModelVariant.DUNE_VIT_BASE_336: {
+        "encoder_arch": "vit_base_patch14_dinov2",
+        "decoder_arch": "vit_base_decoder",
+        "patch_size": 14,
+        "embed_dim": 768,
+        "num_heads": 12,
+        "depth": 12,
+        "native_resolution": 336,
+        "hf_repo": HF_REPO_DUNE,
+        "checkpoints": {
+            "encoder": {
+                "url": f"{NAVER_CDN_BASE}/dune/dune_vitbase14_336.pth",
+                "filename": "dune_vitbase14_336.pth",
+                "hf_filename": "dune_vit_base_336/encoder.safetensors",
+                "size_mb": 420,
+            },
+            "decoder": {
+                "url": f"{NAVER_CDN_BASE}/dune/dunemast3r_cvpr25_vitbase.pth",
+                "filename": "dunemast3r_cvpr25_vitbase.pth",
+                "hf_filename": "dune_vit_base_336/decoder.safetensors",
+                "size_mb": 1325,
+            },
+        },
+    },
+    ModelVariant.DUNE_VIT_BASE_448: {
         "encoder_arch": "vit_base_patch14_dinov2",
         "decoder_arch": "vit_base_decoder",
         "patch_size": 14,
@@ -80,15 +147,18 @@ MODEL_SPECS: dict[ModelVariant, dict] = {
         "num_heads": 12,
         "depth": 12,
         "native_resolution": 448,
+        "hf_repo": HF_REPO_DUNE,
         "checkpoints": {
             "encoder": {
                 "url": f"{NAVER_CDN_BASE}/dune/dune_vitbase14_448.pth",
                 "filename": "dune_vitbase14_448.pth",
+                "hf_filename": "dune_vit_base_448/encoder.safetensors",
                 "size_mb": 420,
             },
             "decoder": {
                 "url": f"{NAVER_CDN_BASE}/dune/dunemast3r_cvpr25_vitbase.pth",
                 "filename": "dunemast3r_cvpr25_vitbase.pth",
+                "hf_filename": "dune_vit_base_448/decoder.safetensors",
                 "size_mb": 1325,
             },
         },
@@ -101,20 +171,24 @@ MODEL_SPECS: dict[ModelVariant, dict] = {
         "num_heads": 16,
         "depth": 24,
         "native_resolution": 512,
+        "hf_repo": HF_REPO_MAST3R,
         "checkpoints": {
             "unified": {
                 "url": f"{NAVER_CDN_BASE}/ComputerVision/MASt3R/MASt3R_ViTLarge_BaseDecoder_512_catmlpdpt_metric.pth",
                 "filename": "MASt3R_ViTLarge_BaseDecoder_512_catmlpdpt_metric.pth",
+                "hf_filename": "unified.safetensors",
                 "size_mb": 2627,
             },
             "retrieval": {
                 "url": f"{NAVER_CDN_BASE}/ComputerVision/MASt3R/MASt3R_ViTLarge_BaseDecoder_512_catmlpdpt_metric_retrieval_trainingfree.pth",
                 "filename": "MASt3R_ViTLarge_BaseDecoder_512_catmlpdpt_metric_retrieval_trainingfree.pth",
+                "hf_filename": "retrieval.safetensors",
                 "size_mb": 8,
             },
             "codebook": {
                 "url": f"{NAVER_CDN_BASE}/ComputerVision/MASt3R/MASt3R_ViTLarge_BaseDecoder_512_catmlpdpt_metric_retrieval_codebook.pkl",
                 "filename": "MASt3R_ViTLarge_BaseDecoder_512_catmlpdpt_metric_retrieval_codebook.pkl",
+                "hf_filename": "codebook.pkl",
                 "size_mb": 256,
             },
         },
@@ -126,7 +200,7 @@ class ModelConfig(BaseModel):
     """Model configuration."""
 
     variant: ModelVariant = Field(
-        default=ModelVariant.DUNE_VIT_SMALL_14,
+        default=ModelVariant.DUNE_VIT_SMALL_336,
         description="Model variant to use",
     )
     resolution: int = Field(
@@ -282,15 +356,15 @@ class MASt3RRuntimeConfig(BaseModel):
 # Preset configurations
 PRESET_DRONE_FAST = MASt3RRuntimeConfig(
     model=ModelConfig(
-        variant=ModelVariant.DUNE_VIT_SMALL_14,
-        resolution=448,
+        variant=ModelVariant.DUNE_VIT_SMALL_336,
+        resolution=336,
         precision=Precision.FP16,
     ),
     runtime=RuntimeConfig(
         backend=BackendType.AUTO,
         use_dual_resolution=True,
         tracking_resolution=224,
-        keyframe_resolution=448,
+        keyframe_resolution=336,
     ),
     matching=MatchingConfig(
         top_k=512,
@@ -300,7 +374,7 @@ PRESET_DRONE_FAST = MASt3RRuntimeConfig(
 
 PRESET_DRONE_QUALITY = MASt3RRuntimeConfig(
     model=ModelConfig(
-        variant=ModelVariant.DUNE_VIT_BASE_14,
+        variant=ModelVariant.DUNE_VIT_BASE_448,
         resolution=448,
         precision=Precision.FP16,
     ),

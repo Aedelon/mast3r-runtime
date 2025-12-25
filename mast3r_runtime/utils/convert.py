@@ -129,6 +129,11 @@ def convert_model(
             print(f"\n[{ckpt_type}] MISSING - download first")
             continue
 
+        # Skip non-tensor files (pickle codebooks, etc.)
+        if pth_path.suffix == ".pkl":
+            print(f"\n[{ckpt_type}] SKIPPED - .pkl files cannot be converted to safetensors")
+            continue
+
         output_path = output_dir / f"{ckpt_type}.safetensors"
 
         print(f"\n[{ckpt_type}]")
@@ -166,7 +171,12 @@ def get_safetensors_paths(
     output_dir = cache_dir / "safetensors" / variant.value
     spec = MODEL_SPECS[variant]
 
-    return {ckpt_type: output_dir / f"{ckpt_type}.safetensors" for ckpt_type in spec["checkpoints"]}
+    # Only include .pth files (skip .pkl codebooks)
+    return {
+        ckpt_type: output_dir / f"{ckpt_type}.safetensors"
+        for ckpt_type, info in spec["checkpoints"].items()
+        if info["filename"].endswith(".pth")
+    }
 
 
 def is_converted(variant: ModelVariant, cache_dir: Path | None = None) -> bool:

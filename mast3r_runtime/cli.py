@@ -9,7 +9,7 @@ import argparse
 import sys
 from pathlib import Path
 
-from .core.config import ModelVariant
+from .core.config import DownloadSource, ModelVariant
 from .utils.convert import convert_all_models, convert_model
 from .utils.downloader import (
     DownloadError,
@@ -22,6 +22,7 @@ from .utils.downloader import (
 def cmd_download(args: argparse.Namespace) -> int:
     """Download model checkpoints."""
     cache_dir = Path(args.cache_dir) if args.cache_dir else None
+    source = DownloadSource(args.source)
 
     try:
         if args.model == "all":
@@ -29,6 +30,7 @@ def cmd_download(args: argparse.Namespace) -> int:
                 cache_dir=cache_dir,
                 force=args.force,
                 quiet=args.quiet,
+                source=source,
             )
         else:
             variant = ModelVariant(args.model)
@@ -37,6 +39,7 @@ def cmd_download(args: argparse.Namespace) -> int:
                 cache_dir=cache_dir,
                 force=args.force,
                 quiet=args.quiet,
+                source=source,
             )
         return 0
 
@@ -117,6 +120,13 @@ def main() -> int:
         "-q",
         action="store_true",
         help="Suppress output",
+    )
+    dl_parser.add_argument(
+        "--source",
+        "-s",
+        choices=[s.value for s in DownloadSource],
+        default="auto",
+        help="Download source: auto (HF first), hf (HuggingFace safetensors), naver (official .pth)",
     )
     dl_parser.set_defaults(func=cmd_download)
 
