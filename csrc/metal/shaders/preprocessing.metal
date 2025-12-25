@@ -61,13 +61,46 @@ kernel void preprocess_image(
 
 /**
  * Fast resize using threadgroup shared memory.
+ *
+ * Uses tile-based loading to reduce global memory bandwidth.
+ * Each threadgroup processes a TILE_SIZE x TILE_SIZE output tile,
+ * pre-loading required input pixels into shared memory.
  */
-kernel void resize_bilinear(
+constant int PREPROCESS_TILE_SIZE = 16;
+constant int PREPROCESS_TILE_MARGIN = 2;  // For bilinear interpolation
+constant int PREPROCESS_SHARED_SIZE = PREPROCESS_TILE_SIZE + PREPROCESS_TILE_MARGIN;
+
+kernel void resize_bilinear_tiled(
     device const uchar4* input [[buffer(0)]],
     device float4* output [[buffer(1)]],
     constant PreprocessParams& params [[buffer(2)]],
-    uint2 gid [[thread_position_in_grid]]
+    uint2 gid [[thread_position_in_grid]],
+    uint2 tid [[thread_position_in_threadgroup]],
+    uint2 tgid [[threadgroup_position_in_grid]]
 ) {
+    // Shared memory tile for input pixels
+    threadgroup float4 tile[PREPROCESS_SHARED_SIZE][PREPROCESS_SHARED_SIZE];
+
+    // Calculate tile bounds in source image
+    float tile_src_x0 = float(tgid.x * PREPROCESS_TILE_SIZE) * params.scale_x;
+    float tile_src_y0 = float(tgid.y * PREPROCESS_TILE_SIZE) * params.scale_y;
+
+    int src_x_start = max(0, int(floor(tile_src_x0)) - 1);
+    int src_y_start = max(0, int(floor(tile_src_y0)) - 1);
+
+    // Cooperatively load input tile into shared memory
+    for (int dy = tid.y; dy < PREPROCESS_SHARED_SIZE; dy += PREPROCESS_TILE_SIZE) {
+        for (int dx = tid.x; dx < PREPROCESS_SHARED_SIZE; dx += PREPROCESS_TILE_SIZE) {
+            int src_x = clamp(src_x_start + dx, 0, params.src_width - 1);
+            int src_y = clamp(src_y_start + dy, 0, params.src_height - 1);
+            uchar4 pixel = input[src_y * params.src_width + src_x];
+            tile[dy][dx] = float4(pixel) / 255.0f;
+        }
+    }
+
+    threadgroup_barrier(mem_flags::mem_threadgroup);
+
+    // Now compute output using shared memory
     if (gid.x >= uint(params.dst_width) || gid.y >= uint(params.dst_height)) {
         return;
     }
@@ -76,32 +109,94 @@ kernel void resize_bilinear(
     float src_x = (float(gid.x) + 0.5f) * params.scale_x - 0.5f;
     float src_y = (float(gid.y) + 0.5f) * params.scale_y - 0.5f;
 
-    // Integer and fractional parts
-    int x0 = int(floor(src_x));
-    int y0 = int(floor(src_y));
-    int x1 = min(x0 + 1, params.src_width - 1);
-    int y1 = min(y0 + 1, params.src_height - 1);
-    x0 = max(x0, 0);
-    y0 = max(y0, 0);
+    // Local tile coordinates
+    float local_x = src_x - float(src_x_start);
+    float local_y = src_y - float(src_y_start);
 
-    float fx = src_x - float(x0);
-    float fy = src_y - float(y0);
+    int lx0 = int(floor(local_x));
+    int ly0 = int(floor(local_y));
+    int lx1 = min(lx0 + 1, PREPROCESS_SHARED_SIZE - 1);
+    int ly1 = min(ly0 + 1, PREPROCESS_SHARED_SIZE - 1);
+    lx0 = max(lx0, 0);
+    ly0 = max(ly0, 0);
 
-    // Read 4 neighbors
-    uchar4 p00 = input[y0 * params.src_width + x0];
-    uchar4 p01 = input[y0 * params.src_width + x1];
-    uchar4 p10 = input[y1 * params.src_width + x0];
-    uchar4 p11 = input[y1 * params.src_width + x1];
+    float fx = local_x - float(lx0);
+    float fy = local_y - float(ly0);
 
-    // Bilinear interpolation
-    float4 f00 = float4(p00) / 255.0f;
-    float4 f01 = float4(p01) / 255.0f;
-    float4 f10 = float4(p10) / 255.0f;
-    float4 f11 = float4(p11) / 255.0f;
+    // Bilinear interpolation from shared memory (fast!)
+    float4 p00 = tile[ly0][lx0];
+    float4 p01 = tile[ly0][lx1];
+    float4 p10 = tile[ly1][lx0];
+    float4 p11 = tile[ly1][lx1];
 
-    float4 result = mix(mix(f00, f01, fx), mix(f10, f11, fx), fy);
+    float4 result = mix(mix(p00, p01, fx), mix(p10, p11, fx), fy);
 
     output[gid.y * params.dst_width + gid.x] = result;
+}
+
+/**
+ * Fused resize + normalize + HWC->CHW in single pass.
+ * Reduces memory bandwidth by avoiding intermediate buffer.
+ */
+kernel void preprocess_fused(
+    device const uchar4* input [[buffer(0)]],
+    device float* output [[buffer(1)]],  // CHW format
+    constant PreprocessParams& params [[buffer(2)]],
+    uint2 gid [[thread_position_in_grid]],
+    uint2 tid [[thread_position_in_threadgroup]],
+    uint2 tgid [[threadgroup_position_in_grid]]
+) {
+    threadgroup float4 tile[PREPROCESS_SHARED_SIZE][PREPROCESS_SHARED_SIZE];
+
+    float tile_src_x0 = float(tgid.x * PREPROCESS_TILE_SIZE) * params.scale_x;
+    float tile_src_y0 = float(tgid.y * PREPROCESS_TILE_SIZE) * params.scale_y;
+
+    int src_x_start = max(0, int(floor(tile_src_x0)) - 1);
+    int src_y_start = max(0, int(floor(tile_src_y0)) - 1);
+
+    // Load tile
+    for (int dy = tid.y; dy < PREPROCESS_SHARED_SIZE; dy += PREPROCESS_TILE_SIZE) {
+        for (int dx = tid.x; dx < PREPROCESS_SHARED_SIZE; dx += PREPROCESS_TILE_SIZE) {
+            int src_x = clamp(src_x_start + dx, 0, params.src_width - 1);
+            int src_y = clamp(src_y_start + dy, 0, params.src_height - 1);
+            uchar4 pixel = input[src_y * params.src_width + src_x];
+            tile[dy][dx] = float4(pixel) / 255.0f;
+        }
+    }
+
+    threadgroup_barrier(mem_flags::mem_threadgroup);
+
+    if (gid.x >= uint(params.dst_width) || gid.y >= uint(params.dst_height)) {
+        return;
+    }
+
+    // Bilinear from shared memory
+    float src_x = (float(gid.x) + 0.5f) * params.scale_x - 0.5f;
+    float src_y = (float(gid.y) + 0.5f) * params.scale_y - 0.5f;
+
+    float local_x = src_x - float(src_x_start);
+    float local_y = src_y - float(src_y_start);
+
+    int lx0 = clamp(int(floor(local_x)), 0, PREPROCESS_SHARED_SIZE - 1);
+    int ly0 = clamp(int(floor(local_y)), 0, PREPROCESS_SHARED_SIZE - 1);
+    int lx1 = min(lx0 + 1, PREPROCESS_SHARED_SIZE - 1);
+    int ly1 = min(ly0 + 1, PREPROCESS_SHARED_SIZE - 1);
+
+    float fx = local_x - float(lx0);
+    float fy = local_y - float(ly0);
+
+    float4 result = mix(mix(tile[ly0][lx0], tile[ly0][lx1], fx),
+                        mix(tile[ly1][lx0], tile[ly1][lx1], fx), fy);
+
+    // Normalize with ImageNet stats and write CHW
+    float3 normalized = (result.rgb - IMAGENET_MEAN) / IMAGENET_STD;
+
+    int dst_size = params.dst_width * params.dst_height;
+    int pixel_idx = gid.y * params.dst_width + gid.x;
+
+    output[0 * dst_size + pixel_idx] = normalized.r;
+    output[1 * dst_size + pixel_idx] = normalized.g;
+    output[2 * dst_size + pixel_idx] = normalized.b;
 }
 
 /**

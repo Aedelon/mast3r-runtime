@@ -102,39 +102,200 @@ kernel void softmax_inplace(
     }
 }
 
+// ============================================================================
+// FlashAttention-style Tiled Attention
+// ============================================================================
+
+constant int ATTN_TILE_SIZE = 32;      // Tile size for Q/K blocks
+constant int ATTN_HEAD_DIM = 64;       // Common head dimension (64 or 128)
+
 /**
- * Scaled dot-product attention for single head.
+ * Tiled attention computation (FlashAttention-style).
  *
- * attention = softmax(Q @ K^T / sqrt(d)) @ V
+ * Computes attention in tiles to maximize SRAM reuse:
+ * - Load Q tile, iterate over K/V tiles
+ * - Accumulate softmax and output incrementally
+ * - Avoids materializing full attention matrix
+ *
+ * For each query tile:
+ *   for each key tile:
+ *     S = Q_tile @ K_tile^T / sqrt(d)
+ *     Update running softmax and output
  */
-kernel void attention_single_head(
-    device const float* Q [[buffer(0)]],  // [seq_len, head_dim]
-    device const float* K [[buffer(1)]],  // [seq_len, head_dim]
-    device const float* V [[buffer(2)]],  // [seq_len, head_dim]
-    device float* output [[buffer(3)]],   // [seq_len, head_dim]
-    device float* attn_weights [[buffer(4)]],  // [seq_len, seq_len] workspace
-    constant int2& dims [[buffer(5)]],    // seq_len, head_dim
-    uint2 gid [[thread_position_in_grid]]
+kernel void attention_tiled(
+    device const half* Q [[buffer(0)]],     // [seq_len, head_dim] F16
+    device const half* K [[buffer(1)]],     // [seq_len, head_dim] F16
+    device const half* V [[buffer(2)]],     // [seq_len, head_dim] F16
+    device half* output [[buffer(3)]],       // [seq_len, head_dim] F16
+    constant int2& dims [[buffer(4)]],       // seq_len, head_dim
+    uint2 tid [[thread_position_in_threadgroup]],
+    uint2 tgid [[threadgroup_position_in_grid]]
 ) {
     const int seq_len = dims.x;
     const int head_dim = dims.y;
-    const float scale = 1.0f / sqrt(float(head_dim));
+    const float scale = rsqrt(float(head_dim));
 
-    // This is a simplified version - real implementation would be tiled
+    // Shared memory for tiles
+    threadgroup float q_tile[ATTN_TILE_SIZE][ATTN_HEAD_DIM];
+    threadgroup float k_tile[ATTN_TILE_SIZE][ATTN_HEAD_DIM];
+    threadgroup float v_tile[ATTN_TILE_SIZE][ATTN_HEAD_DIM];
+    threadgroup float s_tile[ATTN_TILE_SIZE][ATTN_TILE_SIZE];  // Attention scores
 
-    int i = gid.y;  // Query position
-    int j = gid.x;  // Key position
+    const int q_start = tgid.y * ATTN_TILE_SIZE;
+    const int local_q = tid.y;
+    const int global_q = q_start + local_q;
 
-    if (i >= seq_len || j >= seq_len) return;
+    // Running statistics for online softmax
+    float row_max = -INFINITY;
+    float row_sum = 0.0f;
+    float output_acc[ATTN_HEAD_DIM];
 
-    // Compute Q[i] @ K[j]^T
-    float dot = 0.0f;
-    for (int k = 0; k < head_dim; ++k) {
-        dot += Q[i * head_dim + k] * K[j * head_dim + k];
+    for (int d = 0; d < head_dim; ++d) {
+        output_acc[d] = 0.0f;
     }
-    dot *= scale;
 
-    attn_weights[i * seq_len + j] = dot;
+    // Load Q tile once (reused across all K tiles)
+    if (global_q < seq_len && tid.x < uint(head_dim)) {
+        q_tile[local_q][tid.x] = float(Q[global_q * head_dim + tid.x]);
+    }
+    threadgroup_barrier(mem_flags::mem_threadgroup);
+
+    // Iterate over K/V tiles
+    for (int k_start = 0; k_start < seq_len; k_start += ATTN_TILE_SIZE) {
+        const int local_k = tid.y;
+        const int global_k = k_start + local_k;
+
+        // Load K and V tiles
+        if (global_k < seq_len && tid.x < uint(head_dim)) {
+            k_tile[local_k][tid.x] = float(K[global_k * head_dim + tid.x]);
+            v_tile[local_k][tid.x] = float(V[global_k * head_dim + tid.x]);
+        }
+        threadgroup_barrier(mem_flags::mem_threadgroup);
+
+        // Compute S = Q @ K^T for this tile
+        if (local_q < ATTN_TILE_SIZE && tid.x < ATTN_TILE_SIZE) {
+            float dot = 0.0f;
+            for (int d = 0; d < head_dim; ++d) {
+                dot += q_tile[local_q][d] * k_tile[tid.x][d];
+            }
+            s_tile[local_q][tid.x] = dot * scale;
+        }
+        threadgroup_barrier(mem_flags::mem_threadgroup);
+
+        // Online softmax update
+        if (global_q < seq_len && tid.x == 0) {
+            // Find new max in this tile
+            float tile_max = -INFINITY;
+            for (int j = 0; j < ATTN_TILE_SIZE && (k_start + j) < seq_len; ++j) {
+                tile_max = max(tile_max, s_tile[local_q][j]);
+            }
+
+            // Update running max and rescale
+            float old_max = row_max;
+            row_max = max(row_max, tile_max);
+
+            // Rescale previous accumulations
+            float rescale = exp(old_max - row_max);
+            row_sum *= rescale;
+            for (int d = 0; d < head_dim; ++d) {
+                output_acc[d] *= rescale;
+            }
+
+            // Add this tile's contribution
+            for (int j = 0; j < ATTN_TILE_SIZE && (k_start + j) < seq_len; ++j) {
+                float w = exp(s_tile[local_q][j] - row_max);
+                row_sum += w;
+                for (int d = 0; d < head_dim; ++d) {
+                    output_acc[d] += w * v_tile[j][d];
+                }
+            }
+        }
+
+        threadgroup_barrier(mem_flags::mem_threadgroup);
+    }
+
+    // Final normalization and write output
+    if (global_q < seq_len && tid.x == 0) {
+        float inv_sum = 1.0f / row_sum;
+        for (int d = 0; d < head_dim; ++d) {
+            output[global_q * head_dim + d] = half(output_acc[d] * inv_sum);
+        }
+    }
+}
+
+/**
+ * Multi-head attention with tiling.
+ * Each threadgroup handles one query position across all heads.
+ */
+kernel void multihead_attention_tiled(
+    device const half* Q [[buffer(0)]],      // [batch, num_heads, seq_len, head_dim]
+    device const half* K [[buffer(1)]],
+    device const half* V [[buffer(2)]],
+    device half* output [[buffer(3)]],
+    constant int4& dims [[buffer(4)]],        // batch, num_heads, seq_len, head_dim
+    uint3 tgid [[threadgroup_position_in_grid]],
+    uint2 tid [[thread_position_in_threadgroup]]
+) {
+    const int batch = dims.x;
+    const int num_heads = dims.y;
+    const int seq_len = dims.z;
+    const int head_dim = dims.w;
+
+    const int b = tgid.z;
+    const int h = tgid.y;
+
+    if (b >= batch || h >= num_heads) return;
+
+    // Offset to this batch/head
+    const int stride = seq_len * head_dim;
+    const int offset = (b * num_heads + h) * stride;
+
+    device const half* Q_head = Q + offset;
+    device const half* K_head = K + offset;
+    device const half* V_head = V + offset;
+    device half* O_head = output + offset;
+
+    // Use same tiled logic as single-head
+    // (Implementation would duplicate attention_tiled logic with offset pointers)
+
+    // Simplified: Just compute one query per thread for now
+    const int q_idx = tgid.x * ATTN_TILE_SIZE + tid.y;
+    if (q_idx >= seq_len) return;
+
+    const float scale = rsqrt(float(head_dim));
+
+    // Accumulate attention output
+    float acc[ATTN_HEAD_DIM];
+    for (int d = 0; d < head_dim; ++d) acc[d] = 0.0f;
+
+    float row_max = -INFINITY;
+    float row_sum = 0.0f;
+
+    // Compute attention scores and apply to V
+    for (int k_idx = 0; k_idx < seq_len; ++k_idx) {
+        float dot = 0.0f;
+        for (int d = 0; d < head_dim; ++d) {
+            dot += float(Q_head[q_idx * head_dim + d]) *
+                   float(K_head[k_idx * head_dim + d]);
+        }
+        dot *= scale;
+
+        // Online softmax
+        float old_max = row_max;
+        row_max = max(row_max, dot);
+        float rescale = exp(old_max - row_max);
+        row_sum = row_sum * rescale + exp(dot - row_max);
+
+        for (int d = 0; d < head_dim; ++d) {
+            acc[d] = acc[d] * rescale + exp(dot - row_max) * float(V_head[k_idx * head_dim + d]);
+        }
+    }
+
+    // Write output
+    float inv_sum = 1.0f / row_sum;
+    for (int d = 0; d < head_dim; ++d) {
+        O_head[q_idx * head_dim + d] = half(acc[d] * inv_sum);
+    }
 }
 
 /**

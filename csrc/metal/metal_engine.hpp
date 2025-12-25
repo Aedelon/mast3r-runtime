@@ -70,13 +70,14 @@ private:
     id<MTLBuffer> buffer_desc_2_ = nil;
     id<MTLBuffer> buffer_conf_1_ = nil;
     id<MTLBuffer> buffer_conf_2_ = nil;
-
-    // MPSGraph for inference
-    // MPSGraph* graph_ = nil;
 #endif
 
     void allocate_buffers();
     void preprocess_gpu(const ImageView& img, void* output_buffer);
+
+    // Forward declaration for batched processing
+    class CommandBatch;
+    void preprocess_batched(CommandBatch& batch, const ImageView& img1, const ImageView& img2);
 };
 
 }  // namespace metal
