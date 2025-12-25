@@ -65,14 +65,16 @@ public:
         config.resolution = resolution;
         config.num_threads = num_threads;
 
-        if (variant == "dune_vit_small_14") {
-            config.variant = ModelVariant::DUNE_VIT_SMALL_14;
-        } else if (variant == "dune_vit_base_14") {
-            config.variant = ModelVariant::DUNE_VIT_BASE_14;
+        if (variant == "dune_vit_small_336") {
+            config.variant = ModelVariant::DUNE_VIT_SMALL_336;
+        } else if (variant == "dune_vit_small_448") {
+            config.variant = ModelVariant::DUNE_VIT_SMALL_448;
+        } else if (variant == "dune_vit_base_336") {
+            config.variant = ModelVariant::DUNE_VIT_BASE_336;
+        } else if (variant == "dune_vit_base_448") {
+            config.variant = ModelVariant::DUNE_VIT_BASE_448;
         } else if (variant == "mast3r_vit_large") {
             config.variant = ModelVariant::MAST3R_VIT_LARGE;
-        } else if (variant == "dust3r_224_linear") {
-            config.variant = ModelVariant::DUST3R_224_LINEAR;
         } else {
             throw std::runtime_error("Unknown variant: " + variant);
         }
@@ -226,7 +228,7 @@ PYBIND11_MODULE(_metal, m) {
 
     py::class_<PyMetalEngine>(m, "MetalEngine")
         .def(py::init<const std::string&, int, const std::string&, int>(),
-             py::arg("variant") = "dune_vit_small_14",
+             py::arg("variant") = "dune_vit_small_336",
              py::arg("resolution") = 336,
              py::arg("precision") = "fp16",
              py::arg("num_threads") = 4)

@@ -2,18 +2,32 @@
 
 # Compile Metal shaders
 set(METAL_SHADERS
-    ${CMAKE_CURRENT_SOURCE_DIR}/shaders/preprocessing.metal
-    ${CMAKE_CURRENT_SOURCE_DIR}/shaders/attention.metal
-    ${CMAKE_CURRENT_SOURCE_DIR}/shaders/matching.metal
+    preprocessing
+    attention
+    matching
+    topk_sort
 )
 
-# Create metallib from shaders
+set(METAL_AIR_FILES)
+foreach(shader ${METAL_SHADERS})
+    set(SHADER_SRC ${CMAKE_CURRENT_SOURCE_DIR}/shaders/${shader}.metal)
+    set(SHADER_AIR ${CMAKE_CURRENT_BINARY_DIR}/${shader}.air)
+
+    add_custom_command(
+        OUTPUT ${SHADER_AIR}
+        COMMAND xcrun -sdk macosx metal -c ${SHADER_SRC} -o ${SHADER_AIR}
+        DEPENDS ${SHADER_SRC}
+        COMMENT "Compiling ${shader}.metal"
+    )
+    list(APPEND METAL_AIR_FILES ${SHADER_AIR})
+endforeach()
+
+# Combine all .air files into metallib
 add_custom_command(
     OUTPUT ${CMAKE_CURRENT_BINARY_DIR}/mast3r.metallib
-    COMMAND xcrun -sdk macosx metal -c ${METAL_SHADERS} -o ${CMAKE_CURRENT_BINARY_DIR}/mast3r.air
-    COMMAND xcrun -sdk macosx metallib ${CMAKE_CURRENT_BINARY_DIR}/mast3r.air -o ${CMAKE_CURRENT_BINARY_DIR}/mast3r.metallib
-    DEPENDS ${METAL_SHADERS}
-    COMMENT "Compiling Metal shaders"
+    COMMAND xcrun -sdk macosx metallib ${METAL_AIR_FILES} -o ${CMAKE_CURRENT_BINARY_DIR}/mast3r.metallib
+    DEPENDS ${METAL_AIR_FILES}
+    COMMENT "Linking Metal shaders into metallib"
 )
 
 add_custom_target(metal_shaders DEPENDS ${CMAKE_CURRENT_BINARY_DIR}/mast3r.metallib)
@@ -51,6 +65,6 @@ pybind11_add_module(_metal bindings.mm)
 target_link_libraries(_metal PRIVATE mast3r_metal_impl)
 target_compile_options(_metal PRIVATE -fobjc-arc)
 
-# Install
-install(TARGETS _metal DESTINATION mast3r_runtime/backends)
+# Install to package
+install(TARGETS _metal LIBRARY DESTINATION mast3r_runtime/backends)
 install(FILES ${CMAKE_CURRENT_BINARY_DIR}/mast3r.metallib DESTINATION mast3r_runtime/backends)

@@ -2,8 +2,8 @@
 # Copyright 2024 Delanoe Pirard / Aedelon. Apache 2.0.
 
 [build-system]
-requires = ["hatchling"]
-build-backend = "hatchling.build"
+requires = ["scikit-build-core>=0.10", "pybind11>=2.12"]
+build-backend = "scikit_build_core.build"
 
 [project]
 name = "mast3r-runtime"
@@ -92,14 +92,33 @@ Changelog = "https://github.com/aedelon/mast3r-runtime/blob/main/CHANGELOG.md"
 mast3r-runtime = "mast3r_runtime.cli:main"
 
 # ============================================================================
-# Hatch build configuration (pure Python for now)
+# scikit-build-core configuration
 # ============================================================================
 
-[tool.hatch.build.targets.wheel]
-packages = ["mast3r_runtime"]
+[tool.scikit-build]
+# Minimum CMake version
+cmake.version = ">=3.21"
 
-# Note: C++ backends will be added later with scikit-build-core
-# For now, using Python fallback backend only
+# Build directory
+build-dir = "build/{wheel_tag}"
+
+# Wheel configuration - include Python package + native extensions
+wheel.packages = ["mast3r_runtime"]
+
+# CMake configuration
+cmake.args = [
+    "-DBUILD_TESTS=OFF",
+]
+
+# Build in parallel
+[tool.scikit-build.ninja]
+make-fallback = true
+
+# Editable installs
+[tool.scikit-build.editable]
+mode = "redirect"
+rebuild = true
+verbose = true
 
 # ============================================================================
 # Ruff configuration

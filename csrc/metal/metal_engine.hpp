@@ -74,10 +74,6 @@ private:
 
     void allocate_buffers();
     void preprocess_gpu(const ImageView& img, void* output_buffer);
-
-    // Forward declaration for batched processing
-    class CommandBatch;
-    void preprocess_batched(CommandBatch& batch, const ImageView& img1, const ImageView& img2);
 };
 
 }  // namespace metal

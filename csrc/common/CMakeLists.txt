@@ -7,6 +7,7 @@ add_library(mast3r_common STATIC
 
 target_include_directories(mast3r_common PUBLIC
     ${CMAKE_CURRENT_SOURCE_DIR}
+    ${CMAKE_CURRENT_SOURCE_DIR}/..
 )
 
 # Eigen for linear algebra (header-only)

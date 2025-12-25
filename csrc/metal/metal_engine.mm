@@ -210,7 +210,77 @@ InferenceResult MetalEngine::infer(const ImageView& img1, const ImageView& img2)
         auto t0 = Clock::now();
 
         // === PREPROCESSING PASS ===
-        preprocess_batched(batch, img1, img2);
+        // Inlined preprocessing for both images
+        {
+            auto pipeline = ctx.get_pipeline("preprocess_fused");
+            if (!pipeline) {
+                pipeline = ctx.get_pipeline("preprocess_image");
+            }
+
+            if (pipeline) {
+                const int res = config_.resolution;
+
+                // Copy input images to GPU buffers
+                std::memcpy(buffer_img1_.contents, img1.data, img1.size_bytes());
+                std::memcpy(buffer_img2_.contents, img2.data, img2.size_bytes());
+
+                // Prepare parameters
+                struct PreprocessParams {
+                    int src_width;
+                    int src_height;
+                    int dst_width;
+                    int dst_height;
+                    float scale_x;
+                    float scale_y;
+                    int crop_x;
+                    int crop_y;
+                };
+
+                PreprocessParams params1 = {
+                    img1.width, img1.height,
+                    res, res,
+                    float(img1.width) / float(res),
+                    float(img1.height) / float(res),
+                    0, 0
+                };
+
+                PreprocessParams params2 = {
+                    img2.width, img2.height,
+                    res, res,
+                    float(img2.width) / float(res),
+                    float(img2.height) / float(res),
+                    0, 0
+                };
+
+                auto params_buffer1 = ctx.create_buffer(&params1, sizeof(params1));
+                auto params_buffer2 = ctx.create_buffer(&params2, sizeof(params2));
+
+                // Encode both image preprocessing in same command encoder
+                auto enc = batch.encoder();
+                [enc setComputePipelineState:pipeline];
+
+                // Image 1
+                [enc pushDebugGroup:@"Preprocess Image 1"];
+                [enc setBuffer:buffer_img1_ offset:0 atIndex:0];
+                [enc setBuffer:buffer_preprocessed1_ offset:0 atIndex:1];
+                [enc setBuffer:params_buffer1 offset:0 atIndex:2];
+
+                MTLSize gridSize = MTLSizeMake(res, res, 1);
+                MTLSize threadgroupSize = MTLSizeMake(16, 16, 1);
+
+                [enc dispatchThreads:gridSize threadsPerThreadgroup:threadgroupSize];
+                [enc popDebugGroup];
+
+                // Image 2
+                [enc pushDebugGroup:@"Preprocess Image 2"];
+                [enc setBuffer:buffer_img2_ offset:0 atIndex:0];
+                [enc setBuffer:buffer_preprocessed2_ offset:0 atIndex:1];
+                [enc setBuffer:params_buffer2 offset:0 atIndex:2];
+
+                [enc dispatchThreads:gridSize threadsPerThreadgroup:threadgroupSize];
+                [enc popDebugGroup];
+            }
+        }
 
         // Memory barrier between preprocessing and inference
         batch.memoryBarrier();
@@ -255,88 +325,6 @@ InferenceResult MetalEngine::infer(const ImageView& img1, const ImageView& img2)
     }
 
     return result;
-}
-
-void MetalEngine::preprocess_batched(CommandBatch& batch, const ImageView& img1, const ImageView& img2) {
-    @autoreleasepool {
-        auto& ctx = MetalContext::instance();
-
-        // Get fused preprocessing pipeline
-        auto pipeline = ctx.get_pipeline("preprocess_fused");
-        if (!pipeline) {
-            // Fallback: try regular pipeline
-            pipeline = ctx.get_pipeline("preprocess_image");
-        }
-
-        if (!pipeline) {
-            // CPU fallback if no shader available
-            return;
-        }
-
-        const int res = config_.resolution;
-
-        // Copy input images to GPU buffers
-        std::memcpy(buffer_img1_.contents, img1.data, img1.size_bytes());
-        std::memcpy(buffer_img2_.contents, img2.data, img2.size_bytes());
-
-        // Prepare parameters
-        struct PreprocessParams {
-            int src_width;
-            int src_height;
-            int dst_width;
-            int dst_height;
-            float scale_x;
-            float scale_y;
-            int crop_x;
-            int crop_y;
-        };
-
-        PreprocessParams params1 = {
-            img1.width, img1.height,
-            res, res,
-            float(img1.width) / float(res),
-            float(img1.height) / float(res),
-            0, 0
-        };
-
-        PreprocessParams params2 = {
-            img2.width, img2.height,
-            res, res,
-            float(img2.width) / float(res),
-            float(img2.height) / float(res),
-            0, 0
-        };
-
-        auto params_buffer1 = ctx.create_buffer(&params1, sizeof(params1));
-        auto params_buffer2 = ctx.create_buffer(&params2, sizeof(params2));
-
-        // Encode both image preprocessing in same command encoder
-        auto enc = batch.encoder();
-        [enc setComputePipelineState:pipeline];
-
-        // Image 1
-        [enc pushDebugGroup:@"Preprocess Image 1"];
-        [enc setBuffer:buffer_img1_ offset:0 atIndex:0];
-        [enc setBuffer:buffer_preprocessed1_ offset:0 atIndex:1];
-        [enc setBuffer:params_buffer1 offset:0 atIndex:2];
-
-        MTLSize gridSize = MTLSizeMake(res, res, 1);
-        NSUInteger w = pipeline.threadExecutionWidth;
-        NSUInteger h = pipeline.maxTotalThreadsPerThreadgroup / w;
-        MTLSize threadgroupSize = MTLSizeMake(16, 16, 1);  // Match PREPROCESS_TILE_SIZE
-
-        [enc dispatchThreads:gridSize threadsPerThreadgroup:threadgroupSize];
-        [enc popDebugGroup];
-
-        // Image 2
-        [enc pushDebugGroup:@"Preprocess Image 2"];
-        [enc setBuffer:buffer_img2_ offset:0 atIndex:0];
-        [enc setBuffer:buffer_preprocessed2_ offset:0 atIndex:1];
-        [enc setBuffer:params_buffer2 offset:0 atIndex:2];
-
-        [enc dispatchThreads:gridSize threadsPerThreadgroup:threadgroupSize];
-        [enc popDebugGroup];
-    }
 }
 
 void MetalEngine::preprocess_gpu(const ImageView& img, void* output_buffer) {

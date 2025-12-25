@@ -27,7 +27,7 @@ struct PreprocessParams {
  * Output: float [3, dst_H, dst_W] (CHW format, normalized)
  */
 kernel void preprocess_image(
-    texture2d<float, access::read> input [[texture(0)]],
+    texture2d<float, access::sample> input [[texture(0)]],
     device float* output [[buffer(0)]],
     constant PreprocessParams& params [[buffer(1)]],
     uint2 gid [[thread_position_in_grid]]
@@ -44,7 +44,8 @@ kernel void preprocess_image(
     float2 coord = float2(src_x / float(params.src_width),
                           src_y / float(params.src_height));
 
-    float4 pixel = input.sample(sampler(filter::linear), coord);
+    constexpr sampler linear_sampler(filter::linear);
+    float4 pixel = input.sample(linear_sampler, coord);
 
     // Normalize with ImageNet stats
     float3 rgb = pixel.rgb;

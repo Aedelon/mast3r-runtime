@@ -234,7 +234,7 @@ kernel void multihead_attention_tiled(
     device half* output [[buffer(3)]],
     constant int4& dims [[buffer(4)]],        // batch, num_heads, seq_len, head_dim
     uint3 tgid [[threadgroup_position_in_grid]],
-    uint2 tid [[thread_position_in_threadgroup]]
+    uint3 tid [[thread_position_in_threadgroup]]
 ) {
     const int batch = dims.x;
     const int num_heads = dims.y;

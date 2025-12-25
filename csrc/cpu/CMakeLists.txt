@@ -44,4 +44,4 @@ pybind11_add_module(_cpu bindings.cpp)
 target_link_libraries(_cpu PRIVATE mast3r_cpu_impl)
 
 # Install to package
-install(TARGETS _cpu DESTINATION mast3r_runtime/backends)
+install(TARGETS _cpu LIBRARY DESTINATION mast3r_runtime/backends)
