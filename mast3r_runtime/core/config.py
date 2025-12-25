@@ -107,6 +107,16 @@ MODEL_SPECS: dict[ModelVariant, dict] = {
                 "filename": "MASt3R_ViTLarge_BaseDecoder_512_catmlpdpt_metric.pth",
                 "size_mb": 2627,
             },
+            "retrieval": {
+                "url": f"{NAVER_CDN_BASE}/ComputerVision/MASt3R/MASt3R_ViTLarge_BaseDecoder_512_catmlpdpt_metric_retrieval_trainingfree.pth",
+                "filename": "MASt3R_ViTLarge_BaseDecoder_512_catmlpdpt_metric_retrieval_trainingfree.pth",
+                "size_mb": 8,
+            },
+            "codebook": {
+                "url": f"{NAVER_CDN_BASE}/ComputerVision/MASt3R/MASt3R_ViTLarge_BaseDecoder_512_catmlpdpt_metric_retrieval_codebook.pkl",
+                "filename": "MASt3R_ViTLarge_BaseDecoder_512_catmlpdpt_metric_retrieval_codebook.pkl",
+                "size_mb": 256,
+            },
         },
     },
 }
