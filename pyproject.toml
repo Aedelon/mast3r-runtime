@@ -153,3 +153,22 @@ disallow_untyped_defs = true
 testpaths = ["tests"]
 python_files = ["test_*.py"]
 addopts = "-v --tb=short"
+
+[tool.coverage.run]
+source = ["mast3r_runtime"]
+omit = [
+    # Backends not yet implemented
+    "mast3r_runtime/backends/onnx/*",
+    "mast3r_runtime/backends/coreml/*",
+    "mast3r_runtime/backends/tensorrt/*",
+    # Alternative engine API (not primary)
+    "mast3r_runtime/engine.py",
+]
+
+[tool.coverage.report]
+exclude_lines = [
+    "pragma: no cover",
+    "if TYPE_CHECKING:",
+    "raise NotImplementedError",
+    "@abstractmethod",
+]

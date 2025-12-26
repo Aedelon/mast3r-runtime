@@ -49,6 +49,9 @@ class PythonEngine(EngineInterface):
         super().__init__(config)
         self._weights = None
         self._resolution = config.model.resolution
+        self._patch_size = 14  # ViT patch size
+        # Feature map size is resolution / patch_size
+        self._feature_size = self._resolution // self._patch_size
 
     @property
     def name(self) -> str:
@@ -153,18 +156,18 @@ class PythonEngine(EngineInterface):
         _ = self._preprocess(img2)
         timing["preprocess_ms"] = (time.perf_counter() - t0) * 1000
 
-        # Placeholder outputs
+        # Placeholder outputs at feature map resolution (resolution / patch_size)
         t0 = time.perf_counter()
 
-        res = self._resolution
+        feat_size = self._feature_size  # e.g., 224/14 = 16
         desc_dim = 256  # DUNE descriptor dimension
 
-        pts3d_1 = np.zeros((res, res, 3), dtype=np.float32)
-        pts3d_2 = np.zeros((res, res, 3), dtype=np.float32)
-        desc_1 = np.random.randn(res, res, desc_dim).astype(np.float32)
-        desc_2 = np.random.randn(res, res, desc_dim).astype(np.float32)
-        conf_1 = np.ones((res, res), dtype=np.float32)
-        conf_2 = np.ones((res, res), dtype=np.float32)
+        pts3d_1 = np.zeros((feat_size, feat_size, 3), dtype=np.float32)
+        pts3d_2 = np.zeros((feat_size, feat_size, 3), dtype=np.float32)
+        desc_1 = np.random.randn(feat_size, feat_size, desc_dim).astype(np.float32)
+        desc_2 = np.random.randn(feat_size, feat_size, desc_dim).astype(np.float32)
+        conf_1 = np.ones((feat_size, feat_size), dtype=np.float32)
+        conf_2 = np.ones((feat_size, feat_size), dtype=np.float32)
 
         timing["inference_ms"] = (time.perf_counter() - t0) * 1000
         timing["total_ms"] = timing["preprocess_ms"] + timing["inference_ms"]
