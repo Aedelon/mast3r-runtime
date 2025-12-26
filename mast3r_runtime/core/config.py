@@ -164,9 +164,9 @@ MODEL_SPECS: dict[ModelVariant, dict] = {
         },
     },
     ModelVariant.MAST3R_VIT_LARGE: {
-        "encoder_arch": "vit_large_patch14_dinov2",
-        "decoder_arch": "vit_base_decoder",
-        "patch_size": 14,
+        "encoder_arch": "croco_vit_large",  # CroCoNet, not DINOv2
+        "decoder_arch": "croco_decoder",
+        "patch_size": 16,  # CroCoNet uses 16, not 14
         "embed_dim": 1024,
         "num_heads": 16,
         "depth": 24,
@@ -203,11 +203,11 @@ class ModelConfig(BaseModel):
         default=ModelVariant.DUNE_VIT_SMALL_336,
         description="Model variant to use",
     )
-    resolution: int = Field(
-        default=448,
+    resolution: int | None = Field(
+        default=None,
         ge=224,
         le=560,  # Max 560 = 14 * 40
-        description="Input resolution (must be divisible by patch_size)",
+        description="Input resolution. If None, uses model's native resolution.",
     )
     precision: Precision = Field(
         default=Precision.FP16,
@@ -216,9 +216,14 @@ class ModelConfig(BaseModel):
 
     @model_validator(mode="after")
     def validate_resolution(self) -> ModelConfig:
-        """Ensure resolution is divisible by patch size."""
+        """Set default resolution from model spec and validate."""
         spec = MODEL_SPECS[self.variant]
         patch_size = spec["patch_size"]
+
+        # Use native resolution if not specified
+        if self.resolution is None:
+            object.__setattr__(self, "resolution", spec["native_resolution"])
+
         if self.resolution % patch_size != 0:
             msg = f"Resolution {self.resolution} must be divisible by patch_size {patch_size}"
             raise ValueError(msg)
@@ -393,7 +398,7 @@ PRESET_DRONE_QUALITY = MASt3RRuntimeConfig(
 PRESET_DESKTOP_PRECISION = MASt3RRuntimeConfig(
     model=ModelConfig(
         variant=ModelVariant.MAST3R_VIT_LARGE,
-        resolution=518,  # 518 = 14 * 37 (divisible by patch_size)
+        resolution=512,  # 512 = 16 * 32 (divisible by patch_size)
         precision=Precision.FP32,
     ),
     runtime=RuntimeConfig(

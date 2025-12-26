@@ -3,19 +3,24 @@
 Uses numpy for all operations. Intended for development and debugging.
 Not recommended for production due to performance limitations.
 
+Supports both DUNE (DINOv2-based) and MASt3R (CroCoNet-based) architectures.
+
 Copyright 2024 Delanoe Pirard / Aedelon. Apache 2.0.
 """
 
 from __future__ import annotations
 
 import time
-from typing import TYPE_CHECKING
+from pathlib import Path
+from typing import TYPE_CHECKING, Union
 
 import numpy as np
 from PIL import Image
 
 from ...core.engine_interface import EngineInterface, InferenceResult, MatchResult
 from ...core.preprocessing import IMAGENET_MEAN, IMAGENET_STD
+from .dune_model import DUNEModel
+from .mast3r_model import MASt3RModel
 
 if TYPE_CHECKING:
     from numpy.typing import NDArray
@@ -40,18 +45,26 @@ class PythonEngine(EngineInterface):
     - Real-time applications
     """
 
-    def __init__(self, config: MASt3RRuntimeConfig) -> None:
+    def __init__(self, config: MASt3RRuntimeConfig, *, placeholder: bool = False) -> None:
         """Initialize Python engine.
 
         Args:
             config: Runtime configuration.
+            placeholder: Force placeholder mode (for fast tests).
         """
         super().__init__(config)
-        self._weights = None
+        self._model: Union[DUNEModel, MASt3RModel, None] = None
         self._resolution = config.model.resolution
-        self._patch_size = 14  # ViT patch size
+        # Detect architecture from variant
+        variant = config.model.variant
+        self._is_mast3r = "mast3r" in variant.lower()
+        # MASt3R uses patch_size=16, DUNE uses patch_size=14
+        self._patch_size = 16 if self._is_mast3r else 14
         # Feature map size is resolution / patch_size
         self._feature_size = self._resolution // self._patch_size
+        # Use placeholder mode for fast tests (no real inference)
+        self._placeholder_mode = placeholder
+        self._force_placeholder = placeholder
 
     @property
     def name(self) -> str:
@@ -64,14 +77,61 @@ class PythonEngine(EngineInterface):
         return self._is_ready
 
     def load(self) -> None:
-        """Load model weights.
+        """Load model weights from safetensors.
 
-        Note: For the Python fallback, we don't actually load weights
-        since we can't run the full model. This is a stub that marks
-        the engine as ready for testing purposes.
+        Loads DUNE or MASt3R model from safetensors files in the cache directory.
+        Falls back to placeholder mode if weights are not found.
         """
-        # TODO: Load safetensors weights and implement forward pass
-        # For now, just mark as ready (returns placeholder outputs)
+        # Force placeholder mode for fast tests
+        if self._force_placeholder:
+            self._placeholder_mode = True
+            self._is_ready = True
+            return
+
+        variant = self._config.model.variant
+        cache_dir = Path.home() / ".cache" / "mast3r_runtime" / "safetensors" / variant
+
+        if self._is_mast3r:
+            # MASt3R uses unified.safetensors
+            unified_path = cache_dir / "unified.safetensors"
+            if not unified_path.exists():
+                self._placeholder_mode = True
+                self._is_ready = True
+                return
+
+            self._model = MASt3RModel.from_safetensors(
+                unified_path,
+                encoder_num_heads=16,  # ViT-Large: 1024 / 64
+                decoder_num_heads=12,  # 768 / 64
+            )
+        else:
+            # DUNE uses separate encoder.safetensors + decoder.safetensors
+            encoder_path = cache_dir / "encoder.safetensors"
+            decoder_path = cache_dir / "decoder.safetensors"
+
+            if not encoder_path.exists() or not decoder_path.exists():
+                self._placeholder_mode = True
+                self._is_ready = True
+                return
+
+            # Determine num_heads based on variant
+            if "small" in variant:
+                encoder_num_heads = 6  # 384 / 64
+                decoder_num_heads = 12  # 768 / 64
+            elif "base" in variant:
+                encoder_num_heads = 12  # 768 / 64
+                decoder_num_heads = 12  # 768 / 64
+            else:
+                encoder_num_heads = 16  # 1024 / 64
+                decoder_num_heads = 16  # 1024 / 64
+
+            self._model = DUNEModel.from_safetensors(
+                encoder_path,
+                decoder_path,
+                encoder_num_heads,
+                decoder_num_heads,
+            )
+
         self._is_ready = True
 
     def warmup(self, num_iterations: int = 3) -> None:
@@ -134,16 +194,12 @@ class PythonEngine(EngineInterface):
     ) -> InferenceResult:
         """Run inference on a stereo pair.
 
-        Note: This is a placeholder implementation that returns
-        zeros for all outputs. A real implementation would need
-        to load and run the actual model weights.
-
         Args:
             img1: First image [H, W, 3] RGB uint8.
             img2: Second image [H, W, 3] RGB uint8.
 
         Returns:
-            Inference result (placeholder zeros).
+            Inference result with 3D points, descriptors, and confidence.
         """
         if not self.is_ready:
             self.load()
@@ -152,14 +208,43 @@ class PythonEngine(EngineInterface):
 
         # Preprocess
         t0 = time.perf_counter()
-        _ = self._preprocess(img1)
-        _ = self._preprocess(img2)
+        img1_prep = self._preprocess(img1)
+        img2_prep = self._preprocess(img2)
         timing["preprocess_ms"] = (time.perf_counter() - t0) * 1000
 
-        # Placeholder outputs at feature map resolution (resolution / patch_size)
+        if self._placeholder_mode or self._model is None:
+            # Placeholder outputs for fast tests
+            return self._placeholder_inference(timing)
+
+        # Real model inference
+        t0 = time.perf_counter()
+        outputs = self._model(img1_prep, img2_prep)
+        timing["inference_ms"] = (time.perf_counter() - t0) * 1000
+        timing["total_ms"] = timing["preprocess_ms"] + timing["inference_ms"]
+
+        # Remove batch dimension [B, H, W, C] -> [H, W, C]
+        return InferenceResult(
+            pts3d_1=outputs["pts3d_1"][0],
+            pts3d_2=outputs["pts3d_2"][0],
+            desc_1=outputs["desc_1"][0],
+            desc_2=outputs["desc_2"][0],
+            conf_1=outputs["conf_1"][0],
+            conf_2=outputs["conf_2"][0],
+            timing_ms=timing,
+        )
+
+    def _placeholder_inference(self, timing: dict[str, float]) -> InferenceResult:
+        """Return placeholder outputs for fast tests.
+
+        Args:
+            timing: Timing dictionary with preprocess_ms.
+
+        Returns:
+            Placeholder inference result.
+        """
         t0 = time.perf_counter()
 
-        feat_size = self._feature_size  # e.g., 224/14 = 16
+        feat_size = self._feature_size  # e.g., 336/14 = 24
         desc_dim = 256  # DUNE descriptor dimension
 
         pts3d_1 = np.zeros((feat_size, feat_size, 3), dtype=np.float32)
@@ -222,5 +307,6 @@ class PythonEngine(EngineInterface):
 
     def release(self) -> None:
         """Release resources."""
-        self._weights = None
+        self._model = None
         self._is_ready = False
+        self._placeholder_mode = False

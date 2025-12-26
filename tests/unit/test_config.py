@@ -187,18 +187,19 @@ class TestModelConfig:
         """Default values are correct."""
         config = ModelConfig()
         assert config.variant == ModelVariant.DUNE_VIT_SMALL_336
-        assert config.resolution == 448
+        # Resolution defaults to variant's native resolution (336 for DUNE_VIT_SMALL_336)
+        assert config.resolution == 336
         assert config.precision == Precision.FP16
 
     def test_custom_values(self):
         """Custom values are accepted."""
         config = ModelConfig(
             variant=ModelVariant.MAST3R_VIT_LARGE,
-            resolution=518,
+            resolution=480,  # 480 = 16 * 30 (divisible by MASt3R patch_size)
             precision=Precision.FP32,
         )
         assert config.variant == ModelVariant.MAST3R_VIT_LARGE
-        assert config.resolution == 518
+        assert config.resolution == 480
         assert config.precision == Precision.FP32
 
     def test_resolution_validation_divisible_by_patch(self):
@@ -368,7 +369,7 @@ class TestMASt3RRuntimeConfig:
         yaml_content = """
 model:
   variant: mast3r_vit_large
-  resolution: 518
+  resolution: 480
   precision: fp32
 runtime:
   backend: python
@@ -383,7 +384,7 @@ matching:
         config = MASt3RRuntimeConfig.from_yaml(yaml_path)
 
         assert config.model.variant == ModelVariant.MAST3R_VIT_LARGE
-        assert config.model.resolution == 518
+        assert config.model.resolution == 480  # 480 = 16 * 30
         assert config.runtime.backend == BackendType.PYTHON
         assert config.matching.top_k == 1024
 
@@ -431,7 +432,7 @@ class TestPresets:
         """PRESET_DESKTOP_PRECISION is correct."""
         config = PRESET_DESKTOP_PRECISION
         assert config.model.variant == ModelVariant.MAST3R_VIT_LARGE
-        assert config.model.resolution == 518
+        assert config.model.resolution == 512  # CroCoNet uses patch_size=16
         assert config.model.precision == Precision.FP32
         assert config.runtime.backend == BackendType.PYTHON
         assert config.matching.top_k == 2048

@@ -30,8 +30,8 @@ class TestPythonEngine:
 
     @pytest.fixture
     def engine(self, config):
-        """Create a PythonEngine instance."""
-        return PythonEngine(config)
+        """Create a PythonEngine instance in placeholder mode for fast tests."""
+        return PythonEngine(config, placeholder=True)
 
     def test_creation(self, engine):
         """Engine can be created."""
@@ -58,11 +58,11 @@ class TestPythonEngine:
         assert engine.is_ready is True
 
     def test_infer(self, engine, config, random_rgb_image):
-        """Inference produces correct output shapes."""
+        """Inference produces correct output shapes (placeholder mode)."""
         engine.load()
         result = engine.infer(random_rgb_image, random_rgb_image)
 
-        # Feature map size = resolution / patch_size (14)
+        # Placeholder mode outputs at feature map size (resolution / patch_size)
         feat_size = config.model.resolution // 14
         assert isinstance(result, InferenceResult)
         assert result.pts3d_1.shape == (feat_size, feat_size, 3)
@@ -88,12 +88,13 @@ class TestPythonEngine:
         assert result.timing_ms["total_ms"] >= 0
 
     def test_infer_with_resize(self, engine, config):
-        """Inference handles images needing resize."""
+        """Inference handles images needing resize (placeholder mode)."""
         engine.load()
         # Non-square image that needs resize
         img = np.zeros((240, 640, 3), dtype=np.uint8)
         result = engine.infer(img, img)
 
+        # Placeholder mode outputs at feature map size
         feat_size = config.model.resolution // 14
         assert result.pts3d_1.shape == (feat_size, feat_size, 3)
 
@@ -135,8 +136,8 @@ class TestPythonEngine:
         assert engine.is_ready is False
 
     def test_context_manager(self, config, random_rgb_image):
-        """Engine works as context manager."""
-        with PythonEngine(config) as engine:
+        """Engine works as context manager (placeholder mode)."""
+        with PythonEngine(config, placeholder=True) as engine:
             assert engine.is_ready is True
             result = engine.infer(random_rgb_image, random_rgb_image)
             assert isinstance(result, InferenceResult)
@@ -172,8 +173,8 @@ class TestPythonEnginePreprocessing:
 
     @pytest.fixture
     def engine(self, config):
-        """Create engine."""
-        return PythonEngine(config)
+        """Create engine in placeholder mode for fast tests."""
+        return PythonEngine(config, placeholder=True)
 
     def test_preprocess_normalizes(self, engine, config):
         """Preprocessing normalizes to expected range."""
