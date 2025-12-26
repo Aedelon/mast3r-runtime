@@ -397,11 +397,11 @@ void MetalEngine::allocate_buffers() {
 
         // Local features after pixel shuffle
         // MASt3R: out_dim = 6400 = 25 * 256 = (local_feat_dim + 1) * patch_size^2
-        // pixel_shuffle(factor=16): [pH, pW, 6400] -> [H, W, 25]
-        // local_feat_dim = 24, plus 1 for desc_conf = 25 channels output
-        const int local_feat_dim = 24;
+        // DUNE:   out_dim = 4900 = 25 * 196 = (local_feat_dim + 1) * patch_size^2
+        // pixel_shuffle: [pH, pW, out_dim] -> [H, W, local_feat_dim + 1]
+        // local_feat_dim = 24 for both, plus 1 for desc_conf = 25 channels output
         buffer_local_shuffle_ = ctx.create_buffer(
-            res * res * (local_feat_dim + 1) * sizeof(float));  // [H, W, 25]
+            res * res * (spec_.desc_dim + 1) * sizeof(float));  // [H, W, 25]
 
         NSLog(@"[mast3r] Allocated buffers: %d patches, embed=%d, decoder=%d",
               num_patches, embed_dim, decoder_dim);
@@ -1778,12 +1778,13 @@ void MetalEngine::run_local_features_mlp(
             return;
         }
 
-        // Dimensions from actual weight shapes (verified from safetensors)
-        // fc1_weight: [7168, 1792], fc2_weight: [6400, 7168]
-        const int in_dim = embed_dim + decoder_dim;  // 1024 + 768 = 1792
-        const int hidden_dim = 4 * in_dim;           // 7168
-        const int out_dim = 6400;                    // (24 + 1) * 16^2 = 25 * 256
-        const int local_feat_dim = 24;               // Actual MASt3R descriptor dim
+        // Dimensions computed from model spec
+        // MASt3R: fc1=[7168, 1792], fc2=[6400, 7168], out=(24+1)*16^2=6400
+        // DUNE:   fc1=[4608, 1152], fc2=[4900, 4608], out=(24+1)*14^2=4900
+        const int in_dim = embed_dim + decoder_dim;
+        const int hidden_dim = 4 * in_dim;
+        const int local_feat_dim = spec_.desc_dim;   // 24 for both DUNE and MASt3R
+        const int out_dim = (local_feat_dim + 1) * P * P;  // (24+1) * patch_size^2
 
         id<MTLCommandBuffer> cmd = [ctx.command_queue() commandBuffer];
         cmd.label = @"Local Features MLP";

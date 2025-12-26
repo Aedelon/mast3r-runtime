@@ -51,13 +51,14 @@ struct ModelSpec {
 inline ModelSpec get_model_spec(ModelVariant variant) {
     switch (variant) {
         case ModelVariant::DUNE_VIT_SMALL_336:
-            return {ArchType::DUNE, 14, 384, 6, 12, 768, 12, 12, 336, 256};
+            // desc_dim=24: MLP output = (24+1) * 14^2 = 4900
+            return {ArchType::DUNE, 14, 384, 6, 12, 768, 12, 12, 336, 24};
         case ModelVariant::DUNE_VIT_SMALL_448:
-            return {ArchType::DUNE, 14, 384, 6, 12, 768, 12, 12, 448, 256};
+            return {ArchType::DUNE, 14, 384, 6, 12, 768, 12, 12, 448, 24};
         case ModelVariant::DUNE_VIT_BASE_336:
-            return {ArchType::DUNE, 14, 768, 12, 12, 768, 12, 12, 336, 256};
+            return {ArchType::DUNE, 14, 768, 12, 12, 768, 12, 12, 336, 24};
         case ModelVariant::DUNE_VIT_BASE_448:
-            return {ArchType::DUNE, 14, 768, 12, 12, 768, 12, 12, 448, 256};
+            return {ArchType::DUNE, 14, 768, 12, 12, 768, 12, 12, 448, 24};
         case ModelVariant::MAST3R_VIT_LARGE:
             // desc_dim=24 is the actual local_feat_dim from official MASt3R (not 256)
             // MLP output: 6400 = (24+1) * 16^2, pixel_shuffle gives 25 channels, first 24 are descriptors
