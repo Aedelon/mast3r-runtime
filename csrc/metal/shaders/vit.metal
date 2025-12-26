@@ -364,6 +364,73 @@ kernel void apply_rope_2d(
     }
 }
 
+/**
+ * Apply RoPE 2D to Q or K with [H, N, D] layout (v7).
+ * Same rotation logic as apply_rope_2d but with transposed memory layout.
+ */
+kernel void apply_rope_2d_hnd(
+    device float* qk [[buffer(0)]],               // [H, N, head_dim] in/out (FP32)
+    device const float* positions [[buffer(1)]],  // [N, 2] y,x positions (FP32)
+    constant int3& dims [[buffer(2)]],            // N, num_heads, head_dim
+    constant float& freq_base [[buffer(3)]],      // typically 100.0
+    uint3 gid [[thread_position_in_grid]]
+) {
+    const int N = dims.x;
+    const int num_heads = dims.y;
+    const int head_dim = dims.z;
+
+    const int D = head_dim / 2;
+    const int D_half = D / 2;
+
+    int n = gid.x;      // sequence position
+    int h = gid.y;      // head index
+    int p = gid.z;      // rotation pair index
+
+    if (n >= N || h >= num_heads || p >= D_half) return;
+
+    // Get positions
+    float pos_y = positions[n * 2 + 0];
+    float pos_x = positions[n * 2 + 1];
+
+    // Compute frequency for this pair
+    float inv_freq = 1.0f / pow(freq_base, float(2 * p) / float(D));
+
+    // Base offset for this token and head - [H, N, D] layout
+    int base = h * N * head_dim + n * head_dim;
+
+    // ========== Y HALF (indices 0 to D-1) ==========
+    {
+        float angle = pos_y * inv_freq;
+        float cos_val = cos(angle);
+        float sin_val = sin(angle);
+
+        int idx1 = base + p;
+        int idx2 = base + p + D_half;
+
+        float v1 = qk[idx1];
+        float v2 = qk[idx2];
+
+        qk[idx1] = v1 * cos_val - v2 * sin_val;
+        qk[idx2] = v2 * cos_val + v1 * sin_val;
+    }
+
+    // ========== X HALF (indices D to head_dim-1) ==========
+    {
+        float angle = pos_x * inv_freq;
+        float cos_val = cos(angle);
+        float sin_val = sin(angle);
+
+        int idx1 = base + D + p;
+        int idx2 = base + D + p + D_half;
+
+        float v1 = qk[idx1];
+        float v2 = qk[idx2];
+
+        qk[idx1] = v1 * cos_val - v2 * sin_val;
+        qk[idx2] = v2 * cos_val + v1 * sin_val;
+    }
+}
+
 // ============================================================================
 // QKV Split and Reshape for Multi-Head Attention
 // ============================================================================
@@ -401,6 +468,83 @@ kernel void split_qkv(
     Q[out_idx] = qkv[qkv_base + hd];
     K[out_idx] = qkv[qkv_base + D + hd];
     V[out_idx] = qkv[qkv_base + 2 * D + hd];
+}
+
+/**
+ * Split QKV projection with TRANSPOSED output layout.
+ *
+ * Input:  [N, 3*embed_dim]
+ * Output: Q, K, V each [num_heads, N, head_dim] (transposed for better memory coalescing)
+ *
+ * Benefits of [H, N, D] layout:
+ * - All data for one head is contiguous in memory
+ * - When iterating over keys, stride is only D (vs H*D before)
+ * - Better cache utilization in attention kernels
+ */
+kernel void split_qkv_transposed(
+    device const float* qkv [[buffer(0)]],        // [N, 3*D]
+    device float* Q [[buffer(1)]],                // [H, N, D]
+    device float* K [[buffer(2)]],                // [H, N, D]
+    device float* V [[buffer(3)]],                // [H, N, D]
+    constant int3& dims [[buffer(4)]],            // N, num_heads, head_dim
+    uint2 gid [[thread_position_in_grid]]
+) {
+    const int N = dims.x;
+    const int num_heads = dims.y;
+    const int head_dim = dims.z;
+    const int D = num_heads * head_dim;
+
+    int n = gid.x;       // patch index
+    int hd = gid.y;      // combined head*head_dim index
+
+    if (n >= N || hd >= D) return;
+
+    int h = hd / head_dim;
+    int d = hd % head_dim;
+
+    // Input: [N, 3*D] -> src_idx = n * 3D + component * D + h * head_dim + d
+    int qkv_base = n * 3 * D;
+    int src_q = qkv_base + h * head_dim + d;
+    int src_k = qkv_base + D + h * head_dim + d;
+    int src_v = qkv_base + 2 * D + h * head_dim + d;
+
+    // Output: [H, N, D] -> dst_idx = h * N * D + n * D + d
+    int out_idx = h * (N * head_dim) + n * head_dim + d;
+
+    Q[out_idx] = qkv[src_q];
+    K[out_idx] = qkv[src_k];
+    V[out_idx] = qkv[src_v];
+}
+
+/**
+ * Transpose attention output from [H, N, D] back to [N, D].
+ * Concatenates all heads: output[n, h*head_dim + d] = input[h, n, d]
+ */
+kernel void transpose_hnd_to_nd(
+    device const float* input [[buffer(0)]],      // [H, N, D]
+    device float* output [[buffer(1)]],           // [N, H*D]
+    constant int3& dims [[buffer(2)]],            // N, num_heads, head_dim
+    uint2 gid [[thread_position_in_grid]]
+) {
+    const int N = dims.x;
+    const int num_heads = dims.y;
+    const int head_dim = dims.z;
+
+    int n = gid.x;       // patch index
+    int hd = gid.y;      // combined head*head_dim index
+
+    if (n >= N || hd >= num_heads * head_dim) return;
+
+    int h = hd / head_dim;
+    int d = hd % head_dim;
+
+    // Input: [H, N, D]
+    int src_idx = h * (N * head_dim) + n * head_dim + d;
+
+    // Output: [N, H*D]
+    int dst_idx = n * (num_heads * head_dim) + h * head_dim + d;
+
+    output[dst_idx] = input[src_idx];
 }
 
 // ============================================================================
@@ -1170,6 +1314,46 @@ kernel void attention_output_proj(
     }
 
     output[n * D + d] = sum;
+}
+
+/**
+ * Output projection for [H, N, head_dim] layout (no transpose needed).
+ * Fuses the transpose with the projection to avoid GPU→GPU copy.
+ *
+ * Input layout: [num_heads, N, head_dim] where D = num_heads * head_dim
+ * Output layout: [N, D]
+ */
+kernel void attention_output_proj_hnd(
+    device const float* attn_out [[buffer(0)]],   // [H, N, head_dim] (FP32)
+    device float* output [[buffer(1)]],           // [N, D] (FP32)
+    device const half* weight [[buffer(2)]],      // [D, D] (FP16)
+    device const half* bias [[buffer(3)]],        // [D] (FP16)
+    constant int3& dims [[buffer(4)]],            // N, num_heads, head_dim
+    uint2 gid [[thread_position_in_grid]]
+) {
+    const int N = dims.x;
+    const int num_heads = dims.y;
+    const int head_dim = dims.z;
+    const int D = num_heads * head_dim;
+
+    int n = gid.x;
+    int d_out = gid.y;
+
+    if (n >= N || d_out >= D) return;
+
+    float sum = float(bias[d_out]);
+
+    // Sum over all input dimensions, reading from [H, N, head_dim] layout
+    for (int h = 0; h < num_heads; h++) {
+        for (int hd = 0; hd < head_dim; hd++) {
+            int d_in = h * head_dim + hd;
+            // [H, N, head_dim] access: h * N * head_dim + n * head_dim + hd
+            float in_val = attn_out[h * N * head_dim + n * head_dim + hd];
+            sum += in_val * float(weight[d_out * D + d_in]);
+        }
+    }
+
+    output[n * D + d_out] = sum;
 }
 
 // ============================================================================

@@ -8,6 +8,7 @@ set(METAL_SHADERS
     topk_sort
     vit
     dpt_heads
+    flash_attention
 )
 
 set(METAL_AIR_FILES)

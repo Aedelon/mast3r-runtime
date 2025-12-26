@@ -836,8 +836,23 @@ void MetalEngine::run_encoder(
                 }
             }
 
-            // Split QKV into Q, K, V: [N, 3*D] -> 3x [N, num_heads, head_dim]
-            auto split_pipeline = ctx.get_pipeline("split_qkv");
+            // Check if ALL v7 kernels are available before choosing layout
+            // v7 requires: split_qkv_transposed, flash_attention_v7, transpose_hnd_to_nd
+            // and apply_rope_2d_hnd for MASt3R
+            bool use_v7_layout = false;
+            if (ctx.get_pipeline("flash_attention_v7") &&
+                ctx.get_pipeline("split_qkv_transposed") &&
+                ctx.get_pipeline("transpose_hnd_to_nd")) {
+                if (!spec_.is_mast3r() || ctx.get_pipeline("apply_rope_2d_hnd")) {
+                    use_v7_layout = true;
+                }
+            }
+
+            // Split QKV into Q, K, V
+            // [N, 3*D] -> 3x [H, N, head_dim] for v7, or 3x [N, num_heads, head_dim] for v6
+            auto split_pipeline = use_v7_layout ?
+                ctx.get_pipeline("split_qkv_transposed") :
+                ctx.get_pipeline("split_qkv");
             if (split_pipeline) {
                 [enc setComputePipelineState:split_pipeline];
                 [enc setBuffer:buffer_qkv_ offset:0 atIndex:0];
@@ -852,24 +867,6 @@ void MetalEngine::run_encoder(
                     threadsPerThreadgroup:MTLSizeMake(16, 16, 1)];
 
                 [enc memoryBarrierWithScope:MTLBarrierScopeBuffers];
-
-                // Debug layer 1 and 2 after split_qkv (before RoPE) - FP32
-                if (layer == 1 || layer == 2) {
-                    [enc endEncoding];
-                    [cmd commit];
-                    [cmd waitUntilCompleted];
-                    float* q = (float*)buffer_q_.contents;
-                    float* k = (float*)buffer_k_.contents;
-                    int total = num_patches * D;  // 1024 * 1024 = 1M
-                    int nan_q = 0, nan_k = 0;
-                    for (int i = 0; i < total; i++) {
-                        if (std::isnan(q[i])) nan_q++;
-                        if (std::isnan(k[i])) nan_k++;
-                    }
-                    NSLog(@"[mast3r] L%d after split_qkv (pre-RoPE): Q nan=%d/%d, K nan=%d/%d", layer, nan_q, total, nan_k, total);
-                    cmd = [ctx.command_queue() commandBuffer];
-                    enc = [cmd computeCommandEncoder];
-                }
             }
 
             // Apply RoPE 2D for MASt3R (layer 0 generates positions)
@@ -890,7 +887,10 @@ void MetalEngine::run_encoder(
             }
 
             if (spec_.is_mast3r()) {
-                auto rope_pipeline = ctx.get_pipeline("apply_rope_2d");
+                // Use v7 RoPE kernel for [H, N, D] layout, fallback to v6 for [N, H, D]
+                auto rope_pipeline = use_v7_layout ?
+                    ctx.get_pipeline("apply_rope_2d_hnd") :
+                    ctx.get_pipeline("apply_rope_2d");
                 if (rope_pipeline) {
                     // Apply RoPE to Q
                     [enc setComputePipelineState:rope_pipeline];
@@ -911,128 +911,153 @@ void MetalEngine::run_encoder(
                         threadsPerThreadgroup:MTLSizeMake(8, 8, 4)];
 
                     [enc memoryBarrierWithScope:MTLBarrierScopeBuffers];
-
-                    // Debug layer 1 and 2 after RoPE - check ALL elements (FP32)
-                    if (layer == 1 || layer == 2) {
-                        [enc endEncoding];
-                        [cmd commit];
-                        [cmd waitUntilCompleted];
-                        float* q = (float*)buffer_q_.contents;
-                        float* k = (float*)buffer_k_.contents;
-                        int total = num_patches * D;  // 1024 * 1024 = 1M
-                        int nan_q = 0, nan_k = 0;
-                        for (int i = 0; i < total; i++) {
-                            if (std::isnan(q[i])) nan_q++;
-                            if (std::isnan(k[i])) nan_k++;
-                        }
-                        NSLog(@"[mast3r] L%d RoPE: Q nan=%d/%d, K nan=%d/%d", layer, nan_q, total, nan_k, total);
-                        cmd = [ctx.command_queue() commandBuffer];
-                        enc = [cmd computeCommandEncoder];
-                    }
                 }
             }
 
-            // Multi-head Self-Attention using 3-pass parallel approach
-            // Pass 1: Compute attention scores Q @ K^T
-            auto scores_pipeline = ctx.get_pipeline("attention_scores");
-            if (scores_pipeline) {
-                [enc setComputePipelineState:scores_pipeline];
+            // Multi-head Self-Attention using FlashAttention
+            // v8 = double buffering, v7 = [H, N, D] layout, v6 = 512 threads with simd_sum
+            id<MTLComputePipelineState> flash_attn_pipeline = nil;
+            int flash_version = 0;
+
+            if (use_v7_layout) {
+                // Try v9 first (8 queries/threadgroup, better compute density)
+                flash_attn_pipeline = ctx.get_pipeline("flash_attention_v9");
+                flash_version = 9;
+                if (!flash_attn_pipeline) {
+                    flash_attn_pipeline = ctx.get_pipeline("flash_attention_v8");
+                    flash_version = 8;
+                }
+                if (!flash_attn_pipeline) {
+                    flash_attn_pipeline = ctx.get_pipeline("flash_attention_v7");
+                    flash_version = 7;
+                }
+            }
+            if (!flash_attn_pipeline) {
+                flash_attn_pipeline = ctx.get_pipeline("flash_attention_512");
+                flash_version = 6;  // v6 = 512 threads with simd_sum
+            }
+            if (!flash_attn_pipeline) {
+                flash_attn_pipeline = ctx.get_pipeline("flash_attention_256");
+                flash_version = 5;  // v5 = 256 threads
+            }
+            if (!flash_attn_pipeline) {
+                flash_attn_pipeline = ctx.get_pipeline("flash_attention_multihead");
+                flash_version = 4;  // v4 = 64 threads
+            }
+            if (!flash_attn_pipeline) {
+                flash_attn_pipeline = ctx.get_pipeline("flash_attention_tiled");
+                flash_version = 3;  // v3 = 32 threads
+            }
+            if (!flash_attn_pipeline) {
+                flash_attn_pipeline = ctx.get_pipeline("flash_attention_v2");
+                flash_version = 2;
+            }
+            if (flash_attn_pipeline) {
+                // Log version once per encoder run
+                if (layer == 0) {
+                    NSLog(@"[mast3r] Encoder using FlashAttention v%d (layout=%s)",
+                          flash_version, use_v7_layout ? "HND" : "NHD");
+                }
+                [enc setComputePipelineState:flash_attn_pipeline];
                 [enc setBuffer:buffer_q_ offset:0 atIndex:0];
                 [enc setBuffer:buffer_k_ offset:0 atIndex:1];
-                [enc setBuffer:buffer_attn_ offset:0 atIndex:2];
+                [enc setBuffer:buffer_v_ offset:0 atIndex:2];
+                [enc setBuffer:buffer_attn_out_ offset:0 atIndex:3];
 
                 int dims3[3] = {num_patches, num_heads, head_dim};
-                [enc setBytes:dims3 length:sizeof(dims3) atIndex:3];
+                [enc setBytes:dims3 length:sizeof(dims3) atIndex:4];
 
-                [enc dispatchThreads:MTLSizeMake(num_patches, num_patches, num_heads)
-                    threadsPerThreadgroup:MTLSizeMake(16, 16, 1)];
-
-                [enc memoryBarrierWithScope:MTLBarrierScopeBuffers];
-
-                // Debug layer 1 and 2 after attention_scores (FP32)
-                if (layer == 1 || layer == 2) {
-                    [enc endEncoding];
-                    [cmd commit];
-                    [cmd waitUntilCompleted];
-                    float* attn = (float*)buffer_attn_.contents;
-                    int total = num_heads * num_patches * num_patches;  // 16 * 1024 * 1024 = 16M
-                    int nan = 0;
-                    float min_v = INFINITY, max_v = -INFINITY;
-                    for (int i = 0; i < total; i++) {
-                        float v = attn[i];
-                        if (std::isnan(v) || std::isinf(v)) nan++;
-                        else { min_v = std::min(min_v, v); max_v = std::max(max_v, v); }
-                    }
-                    NSLog(@"[mast3r] L%d attn_scores: nan=%d/%d, range=[%.1f, %.1f]", layer, nan, total, min_v, max_v);
-                    cmd = [ctx.command_queue() commandBuffer];
-                    enc = [cmd computeCommandEncoder];
+                if (flash_version == 9) {
+                    // flash_attention_v9: Grid [num_heads, ceil(N/8)]
+                    // Threadgroup [32, 8] = 256 threads (8 queries per TG)
+                    const int QUERIES_PER_TG = 8;
+                    int num_q_tiles = (num_patches + QUERIES_PER_TG - 1) / QUERIES_PER_TG;
+                    [enc dispatchThreadgroups:MTLSizeMake(num_heads, num_q_tiles, 1)
+                        threadsPerThreadgroup:MTLSizeMake(32, 8, 1)];
+                } else if (flash_version == 8 || flash_version == 7 || flash_version == 6) {
+                    // flash_attention_v8/v7/512: Grid [num_heads, ceil(N/16)]
+                    // Threadgroup [32, 16] = 512 threads (SIMD-aligned)
+                    const int QUERIES_PER_TG = 16;
+                    int num_q_tiles = (num_patches + QUERIES_PER_TG - 1) / QUERIES_PER_TG;
+                    [enc dispatchThreadgroups:MTLSizeMake(num_heads, num_q_tiles, 1)
+                        threadsPerThreadgroup:MTLSizeMake(32, 16, 1)];
+                } else if (flash_version == 5) {
+                    // flash_attention_256: Grid [ceil(num_heads/4), ceil(N/64)]
+                    // Threadgroup [64, 4] = 256 threads
+                    const int TILE_Q = 64;
+                    const int HEADS_PER_TG = 4;
+                    int num_q_tiles = (num_patches + TILE_Q - 1) / TILE_Q;
+                    int num_h_tiles = (num_heads + HEADS_PER_TG - 1) / HEADS_PER_TG;
+                    [enc dispatchThreadgroups:MTLSizeMake(num_h_tiles, num_q_tiles, 1)
+                        threadsPerThreadgroup:MTLSizeMake(TILE_Q, HEADS_PER_TG, 1)];
+                } else if (flash_version == 4) {
+                    // flash_attention_multihead: Grid [ceil(num_heads/2), num_q_tiles]
+                    const int TILE_Q = 32;
+                    const int HEADS_PER_TG = 2;
+                    int num_q_tiles = (num_patches + TILE_Q - 1) / TILE_Q;
+                    int num_h_tiles = (num_heads + HEADS_PER_TG - 1) / HEADS_PER_TG;
+                    [enc dispatchThreadgroups:MTLSizeMake(num_h_tiles, num_q_tiles, 1)
+                        threadsPerThreadgroup:MTLSizeMake(TILE_Q, HEADS_PER_TG, 1)];
+                } else {
+                    // flash_attention_tiled/v2: Grid [num_heads, num_q_tiles], TG [32, 1]
+                    const int TILE_Q = 32;
+                    int num_q_tiles = (num_patches + TILE_Q - 1) / TILE_Q;
+                    [enc dispatchThreadgroups:MTLSizeMake(num_heads, num_q_tiles, 1)
+                        threadsPerThreadgroup:MTLSizeMake(TILE_Q, 1, 1)];
                 }
-            }
-
-            // Pass 2: Softmax over each row
-            auto softmax_pipeline = ctx.get_pipeline("attention_softmax");
-            if (softmax_pipeline) {
-                [enc setComputePipelineState:softmax_pipeline];
-                [enc setBuffer:buffer_attn_ offset:0 atIndex:0];
-
-                int dims2[2] = {num_patches, num_heads};
-                [enc setBytes:dims2 length:sizeof(dims2) atIndex:1];
-
-                // Grid: [N, num_heads] - one thread per row
-                [enc dispatchThreads:MTLSizeMake(num_patches, num_heads, 1)
-                    threadsPerThreadgroup:MTLSizeMake(256, 1, 1)];
 
                 [enc memoryBarrierWithScope:MTLBarrierScopeBuffers];
+                // Note: For v7/v8/v9 layouts, output is [H, N, D].
+                // We use attention_output_proj_hnd to fuse transpose with projection.
+            } else {
+                // Fallback to 3-pass if flash_attention_v2 not available
+                auto scores_pipeline = ctx.get_pipeline("attention_scores");
+                auto softmax_pipeline = ctx.get_pipeline("attention_softmax");
+                auto output_pipeline = ctx.get_pipeline("attention_output");
 
-                // Debug layer 1 after softmax (FP32)
-                if (layer == 1) {
-                    [enc endEncoding];
-                    [cmd commit];
-                    [cmd waitUntilCompleted];
-                    float* attn = (float*)buffer_attn_.contents;
-                    int total = num_heads * num_patches * num_patches;
-                    int nan = 0;
-                    for (int i = 0; i < total; i++) if (std::isnan(attn[i]) || std::isinf(attn[i])) nan++;
-                    NSLog(@"[mast3r] L1 after softmax: nan=%d/%d", nan, total);
-                    cmd = [ctx.command_queue() commandBuffer];
-                    enc = [cmd computeCommandEncoder];
+                // Pass 1: Q @ K^T
+                if (scores_pipeline) {
+                    [enc setComputePipelineState:scores_pipeline];
+                    [enc setBuffer:buffer_q_ offset:0 atIndex:0];
+                    [enc setBuffer:buffer_k_ offset:0 atIndex:1];
+                    [enc setBuffer:buffer_attn_ offset:0 atIndex:2];
+                    int dims3[3] = {num_patches, num_heads, head_dim};
+                    [enc setBytes:dims3 length:sizeof(dims3) atIndex:3];
+                    [enc dispatchThreads:MTLSizeMake(num_patches, num_patches, num_heads)
+                        threadsPerThreadgroup:MTLSizeMake(16, 16, 1)];
+                    [enc memoryBarrierWithScope:MTLBarrierScopeBuffers];
                 }
-            }
 
-            // Pass 3: Compute output = scores @ V
-            auto output_pipeline = ctx.get_pipeline("attention_output");
-            if (output_pipeline) {
-                [enc setComputePipelineState:output_pipeline];
-                [enc setBuffer:buffer_attn_ offset:0 atIndex:0];
-                [enc setBuffer:buffer_v_ offset:0 atIndex:1];
-                [enc setBuffer:buffer_attn_out_ offset:0 atIndex:2];
+                // Pass 2: Softmax
+                if (softmax_pipeline) {
+                    [enc setComputePipelineState:softmax_pipeline];
+                    [enc setBuffer:buffer_attn_ offset:0 atIndex:0];
+                    int dims2[2] = {num_patches, num_heads};
+                    [enc setBytes:dims2 length:sizeof(dims2) atIndex:1];
+                    [enc dispatchThreads:MTLSizeMake(num_patches, num_heads, 1)
+                        threadsPerThreadgroup:MTLSizeMake(256, 1, 1)];
+                    [enc memoryBarrierWithScope:MTLBarrierScopeBuffers];
+                }
 
-                int dims3[3] = {num_patches, num_heads, head_dim};
-                [enc setBytes:dims3 length:sizeof(dims3) atIndex:3];
-
-                // Grid: [N, head_dim, num_heads] - one thread per output element
-                [enc dispatchThreads:MTLSizeMake(num_patches, head_dim, num_heads)
-                    threadsPerThreadgroup:MTLSizeMake(16, 8, 4)];
-
-                [enc memoryBarrierWithScope:MTLBarrierScopeBuffers];
-
-                // Debug layer 1 after attention_output (FP32)
-                if (layer == 1) {
-                    [enc endEncoding];
-                    [cmd commit];
-                    [cmd waitUntilCompleted];
-                    float* attn_out = (float*)buffer_attn_out_.contents;
-                    int total = num_patches * D;
-                    int nan = 0;
-                    for (int i = 0; i < total; i++) if (std::isnan(attn_out[i]) || std::isinf(attn_out[i])) nan++;
-                    NSLog(@"[mast3r] L1 after attn_output: nan=%d/%d", nan, total);
-                    cmd = [ctx.command_queue() commandBuffer];
-                    enc = [cmd computeCommandEncoder];
+                // Pass 3: scores @ V
+                if (output_pipeline) {
+                    [enc setComputePipelineState:output_pipeline];
+                    [enc setBuffer:buffer_attn_ offset:0 atIndex:0];
+                    [enc setBuffer:buffer_v_ offset:0 atIndex:1];
+                    [enc setBuffer:buffer_attn_out_ offset:0 atIndex:2];
+                    int dims3[3] = {num_patches, num_heads, head_dim};
+                    [enc setBytes:dims3 length:sizeof(dims3) atIndex:3];
+                    [enc dispatchThreads:MTLSizeMake(num_patches, head_dim, num_heads)
+                        threadsPerThreadgroup:MTLSizeMake(16, 8, 4)];
+                    [enc memoryBarrierWithScope:MTLBarrierScopeBuffers];
                 }
             }
 
             // Output projection: attn_out -> output
-            auto proj_pipeline = ctx.get_pipeline("attention_output_proj");
+            // For v7/v8/v9 layouts, use fused kernel that reads from [H, N, D]
+            auto proj_pipeline = use_v7_layout ?
+                ctx.get_pipeline("attention_output_proj_hnd") :
+                ctx.get_pipeline("attention_output_proj");
             if (proj_pipeline && vit_buffers_->encoder_proj_weight(layer)) {
                 [enc setComputePipelineState:proj_pipeline];
                 [enc setBuffer:buffer_attn_out_ offset:0 atIndex:0];
@@ -1040,8 +1065,15 @@ void MetalEngine::run_encoder(
                 [enc setBuffer:vit_buffers_->encoder_proj_weight(layer) offset:0 atIndex:2];
                 [enc setBuffer:vit_buffers_->encoder_proj_bias(layer) offset:0 atIndex:3];
 
-                int dims[2] = {num_patches, D};
-                [enc setBytes:dims length:sizeof(dims) atIndex:4];
+                if (use_v7_layout) {
+                    // attention_output_proj_hnd: int3 (N, num_heads, head_dim)
+                    int dims3[3] = {num_patches, num_heads, head_dim};
+                    [enc setBytes:dims3 length:sizeof(dims3) atIndex:4];
+                } else {
+                    // attention_output_proj: int2 (N, D)
+                    int dims2[2] = {num_patches, D};
+                    [enc setBytes:dims2 length:sizeof(dims2) atIndex:4];
+                }
 
                 [enc dispatchThreads:MTLSizeMake(num_patches, D, 1)
                     threadsPerThreadgroup:MTLSizeMake(16, 16, 1)];
@@ -2412,55 +2444,104 @@ void MetalEngine::run_decoder(
                 }
             }
 
-            // Self-attention using 3-pass parallel approach
-            auto scores_pipeline = ctx.get_pipeline("attention_scores");
-            auto softmax_pipeline = ctx.get_pipeline("attention_softmax");
-            auto attn_output_pipeline = ctx.get_pipeline("attention_output");
-
-            // Pass 1: attention scores
-            if (scores_pipeline) {
-                [enc setComputePipelineState:scores_pipeline];
+            // Self-attention using FlashAttention
+            // Try v6 (512 threads + SIMD) first, fallback to v5/v4/v3
+            auto flash_attn_pipeline = ctx.get_pipeline("flash_attention_512");
+            int flash_version_self = 6;
+            if (!flash_attn_pipeline) {
+                flash_attn_pipeline = ctx.get_pipeline("flash_attention_256");
+                flash_version_self = 5;
+            }
+            if (!flash_attn_pipeline) {
+                flash_attn_pipeline = ctx.get_pipeline("flash_attention_multihead");
+                flash_version_self = 4;
+            }
+            if (!flash_attn_pipeline) {
+                flash_attn_pipeline = ctx.get_pipeline("flash_attention_tiled");
+                flash_version_self = 3;
+            }
+            if (!flash_attn_pipeline) {
+                flash_attn_pipeline = ctx.get_pipeline("flash_attention_v2");
+                flash_version_self = 2;
+            }
+            if (flash_attn_pipeline) {
+                [enc setComputePipelineState:flash_attn_pipeline];
                 [enc setBuffer:buffer_q_ offset:0 atIndex:0];
                 [enc setBuffer:buffer_k_ offset:0 atIndex:1];
-                [enc setBuffer:buffer_attn_ offset:0 atIndex:2];
+                [enc setBuffer:buffer_v_ offset:0 atIndex:2];
+                [enc setBuffer:buffer_attn_out_ offset:0 atIndex:3];
 
                 int dims3[3] = {num_patches, num_heads, head_dim};
-                [enc setBytes:dims3 length:sizeof(dims3) atIndex:3];
+                [enc setBytes:dims3 length:sizeof(dims3) atIndex:4];
 
-                [enc dispatchThreads:MTLSizeMake(num_patches, num_patches, num_heads)
-                    threadsPerThreadgroup:MTLSizeMake(16, 16, 1)];
-
-                [enc memoryBarrierWithScope:MTLBarrierScopeBuffers];
-            }
-
-            // Pass 2: softmax
-            if (softmax_pipeline) {
-                [enc setComputePipelineState:softmax_pipeline];
-                [enc setBuffer:buffer_attn_ offset:0 atIndex:0];
-
-                int dims2[2] = {num_patches, num_heads};
-                [enc setBytes:dims2 length:sizeof(dims2) atIndex:1];
-
-                [enc dispatchThreads:MTLSizeMake(num_patches, num_heads, 1)
-                    threadsPerThreadgroup:MTLSizeMake(256, 1, 1)];
-
-                [enc memoryBarrierWithScope:MTLBarrierScopeBuffers];
-            }
-
-            // Pass 3: output
-            if (attn_output_pipeline) {
-                [enc setComputePipelineState:attn_output_pipeline];
-                [enc setBuffer:buffer_attn_ offset:0 atIndex:0];
-                [enc setBuffer:buffer_v_ offset:0 atIndex:1];
-                [enc setBuffer:buffer_attn_out_ offset:0 atIndex:2];
-
-                int dims3[3] = {num_patches, num_heads, head_dim};
-                [enc setBytes:dims3 length:sizeof(dims3) atIndex:3];
-
-                [enc dispatchThreads:MTLSizeMake(num_patches, head_dim, num_heads)
-                    threadsPerThreadgroup:MTLSizeMake(16, 8, 4)];
+                if (flash_version_self == 6) {
+                    // flash_attention_512: Grid [num_heads, ceil(N/16)]
+                    // Threadgroup [32, 16] = 512 threads (SIMD-aligned)
+                    const int QUERIES_PER_TG = 16;
+                    int num_q_tiles = (num_patches + QUERIES_PER_TG - 1) / QUERIES_PER_TG;
+                    [enc dispatchThreadgroups:MTLSizeMake(num_heads, num_q_tiles, 1)
+                        threadsPerThreadgroup:MTLSizeMake(32, 16, 1)];
+                } else if (flash_version_self == 5) {
+                    const int TILE_Q = 64;
+                    const int HEADS_PER_TG = 4;
+                    int num_q_tiles = (num_patches + TILE_Q - 1) / TILE_Q;
+                    int num_h_tiles = (num_heads + HEADS_PER_TG - 1) / HEADS_PER_TG;
+                    [enc dispatchThreadgroups:MTLSizeMake(num_h_tiles, num_q_tiles, 1)
+                        threadsPerThreadgroup:MTLSizeMake(TILE_Q, HEADS_PER_TG, 1)];
+                } else if (flash_version_self == 4) {
+                    const int TILE_Q = 32;
+                    const int HEADS_PER_TG = 2;
+                    int num_q_tiles = (num_patches + TILE_Q - 1) / TILE_Q;
+                    int num_h_tiles = (num_heads + HEADS_PER_TG - 1) / HEADS_PER_TG;
+                    [enc dispatchThreadgroups:MTLSizeMake(num_h_tiles, num_q_tiles, 1)
+                        threadsPerThreadgroup:MTLSizeMake(TILE_Q, HEADS_PER_TG, 1)];
+                } else {
+                    const int TILE_Q = 32;
+                    int num_q_tiles = (num_patches + TILE_Q - 1) / TILE_Q;
+                    [enc dispatchThreadgroups:MTLSizeMake(num_heads, num_q_tiles, 1)
+                        threadsPerThreadgroup:MTLSizeMake(TILE_Q, 1, 1)];
+                }
 
                 [enc memoryBarrierWithScope:MTLBarrierScopeBuffers];
+            } else {
+                // Fallback to 3-pass
+                auto scores_pipeline = ctx.get_pipeline("attention_scores");
+                auto softmax_pipeline = ctx.get_pipeline("attention_softmax");
+                auto attn_output_pipeline = ctx.get_pipeline("attention_output");
+
+                if (scores_pipeline) {
+                    [enc setComputePipelineState:scores_pipeline];
+                    [enc setBuffer:buffer_q_ offset:0 atIndex:0];
+                    [enc setBuffer:buffer_k_ offset:0 atIndex:1];
+                    [enc setBuffer:buffer_attn_ offset:0 atIndex:2];
+                    int dims3[3] = {num_patches, num_heads, head_dim};
+                    [enc setBytes:dims3 length:sizeof(dims3) atIndex:3];
+                    [enc dispatchThreads:MTLSizeMake(num_patches, num_patches, num_heads)
+                        threadsPerThreadgroup:MTLSizeMake(16, 16, 1)];
+                    [enc memoryBarrierWithScope:MTLBarrierScopeBuffers];
+                }
+
+                if (softmax_pipeline) {
+                    [enc setComputePipelineState:softmax_pipeline];
+                    [enc setBuffer:buffer_attn_ offset:0 atIndex:0];
+                    int dims2[2] = {num_patches, num_heads};
+                    [enc setBytes:dims2 length:sizeof(dims2) atIndex:1];
+                    [enc dispatchThreads:MTLSizeMake(num_patches, num_heads, 1)
+                        threadsPerThreadgroup:MTLSizeMake(256, 1, 1)];
+                    [enc memoryBarrierWithScope:MTLBarrierScopeBuffers];
+                }
+
+                if (attn_output_pipeline) {
+                    [enc setComputePipelineState:attn_output_pipeline];
+                    [enc setBuffer:buffer_attn_ offset:0 atIndex:0];
+                    [enc setBuffer:buffer_v_ offset:0 atIndex:1];
+                    [enc setBuffer:buffer_attn_out_ offset:0 atIndex:2];
+                    int dims3[3] = {num_patches, num_heads, head_dim};
+                    [enc setBytes:dims3 length:sizeof(dims3) atIndex:3];
+                    [enc dispatchThreads:MTLSizeMake(num_patches, head_dim, num_heads)
+                        threadsPerThreadgroup:MTLSizeMake(16, 8, 4)];
+                    [enc memoryBarrierWithScope:MTLBarrierScopeBuffers];
+                }
             }
 
             // Self-attention output projection
@@ -2604,17 +2685,35 @@ void MetalEngine::run_decoder(
                 }
             }
 
-            // Cross-attention computation (use optimized version)
+            // Cross-attention using FlashAttention
+            // Try v6 (512 threads + SIMD) first, fallback to v5/v4/v3
             // Note: buffer_qkv_ contains [K, V] from the cross_kv projection
             // K = buffer_qkv_[0:D], V = buffer_qkv_[D:2D]
-            auto cross_opt_pipeline = ctx.get_pipeline("cross_attention_optimized");
-            if (!cross_opt_pipeline) {
-                cross_opt_pipeline = cross_attn_pipeline;  // Fallback
+            auto flash_cross_pipeline = ctx.get_pipeline("flash_cross_attention_512");
+            int flash_version_cross = 6;
+            if (!flash_cross_pipeline) {
+                flash_cross_pipeline = ctx.get_pipeline("flash_cross_attention_256");
+                flash_version_cross = 5;
             }
-            if (cross_opt_pipeline) {
-                [enc setComputePipelineState:cross_opt_pipeline];
+            if (!flash_cross_pipeline) {
+                flash_cross_pipeline = ctx.get_pipeline("flash_cross_attention_multihead");
+                flash_version_cross = 4;
+            }
+            if (!flash_cross_pipeline) {
+                flash_cross_pipeline = ctx.get_pipeline("flash_cross_attention");
+                flash_version_cross = 3;
+            }
+            if (!flash_cross_pipeline) {
+                flash_cross_pipeline = ctx.get_pipeline("cross_attention_optimized");
+                flash_version_cross = 2;
+            }
+            if (!flash_cross_pipeline) {
+                flash_cross_pipeline = cross_attn_pipeline;
+                flash_version_cross = 1;
+            }
+            if (flash_cross_pipeline) {
+                [enc setComputePipelineState:flash_cross_pipeline];
                 [enc setBuffer:buffer_cross_q_ offset:0 atIndex:0];
-                // Use buffer_qkv_ for K (first half) and V (second half)
                 [enc setBuffer:buffer_qkv_ offset:0 atIndex:1];  // K starts at offset 0
                 [enc setBuffer:buffer_qkv_ offset:num_patches * D * sizeof(float) atIndex:2];  // V starts at offset D
                 [enc setBuffer:buffer_attn_out_ offset:0 atIndex:3];
@@ -2622,8 +2721,34 @@ void MetalEngine::run_decoder(
                 int dims[4] = {num_patches, num_patches, num_heads, head_dim};
                 [enc setBytes:dims length:sizeof(dims) atIndex:4];
 
-                [enc dispatchThreads:MTLSizeMake(num_patches, num_heads, 1)
-                    threadsPerThreadgroup:MTLSizeMake(32, 4, 1)];
+                if (flash_version_cross == 6) {
+                    // flash_cross_attention_512: Grid [num_heads, ceil(N/16)]
+                    // Threadgroup [32, 16] = 512 threads (SIMD-aligned)
+                    const int QUERIES_PER_TG = 16;
+                    int num_q_tiles = (num_patches + QUERIES_PER_TG - 1) / QUERIES_PER_TG;
+                    [enc dispatchThreadgroups:MTLSizeMake(num_heads, num_q_tiles, 1)
+                        threadsPerThreadgroup:MTLSizeMake(32, 16, 1)];
+                } else if (flash_version_cross == 5) {
+                    // flash_cross_attention_256: Grid [ceil(num_heads/4), ceil(N/64)]
+                    const int TILE_Q = 64;
+                    const int HEADS_PER_TG = 4;
+                    int num_q_tiles = (num_patches + TILE_Q - 1) / TILE_Q;
+                    int num_h_tiles = (num_heads + HEADS_PER_TG - 1) / HEADS_PER_TG;
+                    [enc dispatchThreadgroups:MTLSizeMake(num_h_tiles, num_q_tiles, 1)
+                        threadsPerThreadgroup:MTLSizeMake(TILE_Q, HEADS_PER_TG, 1)];
+                } else if (flash_version_cross == 4) {
+                    const int TILE_Q = 32;
+                    const int HEADS_PER_TG = 2;
+                    int num_q_tiles = (num_patches + TILE_Q - 1) / TILE_Q;
+                    int num_h_tiles = (num_heads + HEADS_PER_TG - 1) / HEADS_PER_TG;
+                    [enc dispatchThreadgroups:MTLSizeMake(num_h_tiles, num_q_tiles, 1)
+                        threadsPerThreadgroup:MTLSizeMake(TILE_Q, HEADS_PER_TG, 1)];
+                } else {
+                    const int TILE_Q = 32;
+                    int num_q_tiles = (num_patches + TILE_Q - 1) / TILE_Q;
+                    [enc dispatchThreadgroups:MTLSizeMake(num_heads, num_q_tiles, 1)
+                        threadsPerThreadgroup:MTLSizeMake(TILE_Q, 1, 1)];
+                }
 
                 [enc memoryBarrierWithScope:MTLBarrierScopeBuffers];
             }
