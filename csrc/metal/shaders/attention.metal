@@ -7,6 +7,24 @@ using namespace metal;
 // Softmax constants
 constant float NEG_INF = -1e9f;
 
+// ============================================================================
+// Error Function (erf) - Winitzki Approximation
+// ============================================================================
+// Approximation with ~0.035% relative error
+// Source: https://www.cs.uaf.edu/2010/spring/cs481/section/1/lecture/02_23_planet.html
+
+inline float erf_approx(float x) {
+    const float pi = 3.14159265359f;
+    const float a = 8.0f * (pi - 3.0f) / (3.0f * pi * (4.0f - pi));  // ~0.140012
+
+    float sign_x = (x >= 0.0f) ? 1.0f : -1.0f;
+    float x2 = x * x;
+
+    // erf(x) = sign(x) * sqrt(1 - exp(-x² * (4/π + a*x²) / (1 + a*x²)))
+    float inner = -x2 * (4.0f / pi + a * x2) / (1.0f + a * x2);
+    return sign_x * sqrt(1.0f - exp(inner));
+}
+
 /**
  * Matrix multiplication: C = A @ B
  *
@@ -121,12 +139,14 @@ constant int ATTN_HEAD_DIM = 64;       // Common head dimension (64 or 128)
  *   for each key tile:
  *     S = Q_tile @ K_tile^T / sqrt(d)
  *     Update running softmax and output
+ *
+ * Mixed precision: FP32 data buffers, FP32 computation.
  */
 kernel void attention_tiled(
-    device const half* Q [[buffer(0)]],     // [seq_len, head_dim] F16
-    device const half* K [[buffer(1)]],     // [seq_len, head_dim] F16
-    device const half* V [[buffer(2)]],     // [seq_len, head_dim] F16
-    device half* output [[buffer(3)]],       // [seq_len, head_dim] F16
+    device const float* Q [[buffer(0)]],     // [seq_len, head_dim] FP32
+    device const float* K [[buffer(1)]],     // [seq_len, head_dim] FP32
+    device const float* V [[buffer(2)]],     // [seq_len, head_dim] FP32
+    device float* output [[buffer(3)]],      // [seq_len, head_dim] FP32
     constant int2& dims [[buffer(4)]],       // seq_len, head_dim
     uint2 tid [[thread_position_in_threadgroup]],
     uint2 tgid [[threadgroup_position_in_grid]]
@@ -156,7 +176,7 @@ kernel void attention_tiled(
 
     // Load Q tile once (reused across all K tiles)
     if (global_q < seq_len && tid.x < uint(head_dim)) {
-        q_tile[local_q][tid.x] = float(Q[global_q * head_dim + tid.x]);
+        q_tile[local_q][tid.x] = Q[global_q * head_dim + tid.x];
     }
     threadgroup_barrier(mem_flags::mem_threadgroup);
 
@@ -167,8 +187,8 @@ kernel void attention_tiled(
 
         // Load K and V tiles
         if (global_k < seq_len && tid.x < uint(head_dim)) {
-            k_tile[local_k][tid.x] = float(K[global_k * head_dim + tid.x]);
-            v_tile[local_k][tid.x] = float(V[global_k * head_dim + tid.x]);
+            k_tile[local_k][tid.x] = K[global_k * head_dim + tid.x];
+            v_tile[local_k][tid.x] = V[global_k * head_dim + tid.x];
         }
         threadgroup_barrier(mem_flags::mem_threadgroup);
 
@@ -218,7 +238,7 @@ kernel void attention_tiled(
     if (global_q < seq_len && tid.x == 0) {
         float inv_sum = 1.0f / row_sum;
         for (int d = 0; d < head_dim; ++d) {
-            output[global_q * head_dim + d] = half(output_acc[d] * inv_sum);
+            output[global_q * head_dim + d] = output_acc[d] * inv_sum;
         }
     }
 }
@@ -226,12 +246,14 @@ kernel void attention_tiled(
 /**
  * Multi-head attention with tiling.
  * Each threadgroup handles one query position across all heads.
+ *
+ * Mixed precision: FP32 data buffers, FP32 computation.
  */
 kernel void multihead_attention_tiled(
-    device const half* Q [[buffer(0)]],      // [batch, num_heads, seq_len, head_dim]
-    device const half* K [[buffer(1)]],
-    device const half* V [[buffer(2)]],
-    device half* output [[buffer(3)]],
+    device const float* Q [[buffer(0)]],      // [batch, num_heads, seq_len, head_dim] FP32
+    device const float* K [[buffer(1)]],      // FP32
+    device const float* V [[buffer(2)]],      // FP32
+    device float* output [[buffer(3)]],       // FP32
     constant int4& dims [[buffer(4)]],        // batch, num_heads, seq_len, head_dim
     uint3 tgid [[threadgroup_position_in_grid]],
     uint3 tid [[thread_position_in_threadgroup]]
@@ -250,10 +272,10 @@ kernel void multihead_attention_tiled(
     const int stride = seq_len * head_dim;
     const int offset = (b * num_heads + h) * stride;
 
-    device const half* Q_head = Q + offset;
-    device const half* K_head = K + offset;
-    device const half* V_head = V + offset;
-    device half* O_head = output + offset;
+    device const float* Q_head = Q + offset;
+    device const float* K_head = K + offset;
+    device const float* V_head = V + offset;
+    device float* O_head = output + offset;
 
     // Use same tiled logic as single-head
     // (Implementation would duplicate attention_tiled logic with offset pointers)
@@ -275,8 +297,7 @@ kernel void multihead_attention_tiled(
     for (int k_idx = 0; k_idx < seq_len; ++k_idx) {
         float dot = 0.0f;
         for (int d = 0; d < head_dim; ++d) {
-            dot += float(Q_head[q_idx * head_dim + d]) *
-                   float(K_head[k_idx * head_dim + d]);
+            dot += Q_head[q_idx * head_dim + d] * K_head[k_idx * head_dim + d];
         }
         dot *= scale;
 
@@ -287,26 +308,26 @@ kernel void multihead_attention_tiled(
         row_sum = row_sum * rescale + exp(dot - row_max);
 
         for (int d = 0; d < head_dim; ++d) {
-            acc[d] = acc[d] * rescale + exp(dot - row_max) * float(V_head[k_idx * head_dim + d]);
+            acc[d] = acc[d] * rescale + exp(dot - row_max) * V_head[k_idx * head_dim + d];
         }
     }
 
     // Write output
     float inv_sum = 1.0f / row_sum;
     for (int d = 0; d < head_dim; ++d) {
-        O_head[q_idx * head_dim + d] = half(acc[d] * inv_sum);
+        O_head[q_idx * head_dim + d] = acc[d] * inv_sum;
     }
 }
 
 /**
- * Layer normalization.
+ * Layer normalization (mixed precision: FP32 data, FP16 weights).
  */
 kernel void layer_norm(
-    device float* x [[buffer(0)]],           // [N, D] input/output
-    device const float* gamma [[buffer(1)]], // [D] scale
-    device const float* beta [[buffer(2)]],  // [D] bias
-    constant int2& dims [[buffer(3)]],       // N, D
-    constant float& eps [[buffer(4)]],       // epsilon
+    device float* x [[buffer(0)]],            // [N, D] input/output (FP32)
+    device const half* gamma [[buffer(1)]],   // [D] scale (FP16 weights)
+    device const half* beta [[buffer(2)]],    // [D] bias (FP16 weights)
+    constant int2& dims [[buffer(3)]],        // N, D
+    constant float& eps [[buffer(4)]],        // epsilon
     uint gid [[thread_position_in_grid]]
 ) {
     const int N = dims.x;
@@ -314,19 +335,19 @@ kernel void layer_norm(
 
     if (gid >= uint(N)) return;
 
-    device float* row = x + gid * D;
+    const int row_start = gid * D;
 
     // Compute mean
     float mean = 0.0f;
     for (int i = 0; i < D; ++i) {
-        mean += row[i];
+        mean += x[row_start + i];
     }
     mean /= float(D);
 
     // Compute variance
     float var = 0.0f;
     for (int i = 0; i < D; ++i) {
-        float diff = row[i] - mean;
+        float diff = x[row_start + i] - mean;
         var += diff * diff;
     }
     var /= float(D);
@@ -334,7 +355,7 @@ kernel void layer_norm(
     // Normalize and scale
     float inv_std = 1.0f / sqrt(var + eps);
     for (int i = 0; i < D; ++i) {
-        row[i] = (row[i] - mean) * inv_std * gamma[i] + beta[i];
+        x[row_start + i] = (x[row_start + i] - mean) * inv_std * float(gamma[i]) + float(beta[i]);
     }
 }
 
@@ -349,9 +370,7 @@ kernel void gelu(
     if (gid >= uint(size)) return;
 
     float v = x[gid];
-    // Approximate GELU: 0.5 * x * (1 + tanh(sqrt(2/pi) * (x + 0.044715 * x^3)))
-    const float sqrt_2_over_pi = 0.7978845608f;
-    const float coeff = 0.044715f;
-    float cdf = 0.5f * (1.0f + tanh(sqrt_2_over_pi * (v + coeff * v * v * v)));
-    x[gid] = v * cdf;
+    // GELU(x) = x * 0.5 * (1 + erf(x / sqrt(2)))
+    const float inv_sqrt2 = 0.7071067811865476f;
+    x[gid] = v * 0.5f * (1.0f + erf_approx(v * inv_sqrt2));
 }

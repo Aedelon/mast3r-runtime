@@ -23,6 +23,72 @@ enum class ModelVariant {
     MAST3R_VIT_LARGE
 };
 
+// Architecture type
+enum class ArchType {
+    DUNE,    // DINOv2 encoder + decoder (patch_size=14)
+    MAST3R   // CroCoNet encoder + decoder (patch_size=16, RoPE 2D)
+};
+
+// Model specification
+struct ModelSpec {
+    ArchType arch;
+    int patch_size;
+    int embed_dim;
+    int num_heads;
+    int depth;
+    int decoder_dim;
+    int decoder_heads;
+    int decoder_depth;
+    int native_resolution;
+    int desc_dim;
+
+    bool is_dune() const { return arch == ArchType::DUNE; }
+    bool is_mast3r() const { return arch == ArchType::MAST3R; }
+    int num_patches(int res) const { return (res / patch_size) * (res / patch_size); }
+};
+
+// Get model spec for variant
+inline ModelSpec get_model_spec(ModelVariant variant) {
+    switch (variant) {
+        case ModelVariant::DUNE_VIT_SMALL_336:
+            return {ArchType::DUNE, 14, 384, 6, 12, 768, 12, 12, 336, 256};
+        case ModelVariant::DUNE_VIT_SMALL_448:
+            return {ArchType::DUNE, 14, 384, 6, 12, 768, 12, 12, 448, 256};
+        case ModelVariant::DUNE_VIT_BASE_336:
+            return {ArchType::DUNE, 14, 768, 12, 12, 768, 12, 12, 336, 256};
+        case ModelVariant::DUNE_VIT_BASE_448:
+            return {ArchType::DUNE, 14, 768, 12, 12, 768, 12, 12, 448, 256};
+        case ModelVariant::MAST3R_VIT_LARGE:
+            // desc_dim=24 is the actual local_feat_dim from official MASt3R (not 256)
+            // MLP output: 6400 = (24+1) * 16^2, pixel_shuffle gives 25 channels, first 24 are descriptors
+            return {ArchType::MAST3R, 16, 1024, 16, 24, 768, 12, 12, 512, 24};
+        default:
+            return {ArchType::DUNE, 14, 384, 6, 12, 768, 12, 12, 336, 256};
+    }
+}
+
+// Get variant name
+inline const char* variant_name(ModelVariant v) {
+    switch (v) {
+        case ModelVariant::DUNE_VIT_SMALL_336: return "dune_vit_small_336";
+        case ModelVariant::DUNE_VIT_SMALL_448: return "dune_vit_small_448";
+        case ModelVariant::DUNE_VIT_BASE_336: return "dune_vit_base_336";
+        case ModelVariant::DUNE_VIT_BASE_448: return "dune_vit_base_448";
+        case ModelVariant::MAST3R_VIT_LARGE: return "mast3r_vit_large";
+        default: return "unknown";
+    }
+}
+
+// Parse variant from string
+inline ModelVariant parse_variant(const std::string& s) {
+    if (s == "dune_vit_small_336") return ModelVariant::DUNE_VIT_SMALL_336;
+    if (s == "dune_vit_small_448") return ModelVariant::DUNE_VIT_SMALL_448;
+    if (s == "dune_vit_base_336") return ModelVariant::DUNE_VIT_BASE_336;
+    if (s == "dune_vit_base_448") return ModelVariant::DUNE_VIT_BASE_448;
+    if (s == "mast3r_vit_large") return ModelVariant::MAST3R_VIT_LARGE;
+    return ModelVariant::DUNE_VIT_SMALL_336;
+}
+
 // Runtime configuration
 struct RuntimeConfig {
     ModelVariant variant = ModelVariant::DUNE_VIT_SMALL_336;
@@ -157,6 +223,55 @@ struct Tensor {
             ptr[i] = f16;
         }
 
+        dtype = DType::F16;
+    }
+
+    // Convert F32 to F16 in-place (for Metal optimization)
+    void f32_to_f16_inplace() {
+        if (dtype != DType::F32) return;
+
+        size_t n = num_elements();
+        std::vector<uint8_t> new_data(n * 2);  // F16 is 2 bytes
+
+        const float* src = reinterpret_cast<const float*>(data.data());
+        uint16_t* dst = reinterpret_cast<uint16_t*>(new_data.data());
+
+        for (size_t i = 0; i < n; i++) {
+            float f = src[i];
+            uint32_t bits = *reinterpret_cast<uint32_t*>(&f);
+
+            uint32_t sign = (bits >> 31) & 1;
+            int32_t exp = ((bits >> 23) & 0xFF) - 127;  // F32 exp bias
+            uint32_t mant = bits & 0x7FFFFF;  // 23-bit mantissa
+
+            // Handle special cases
+            if (exp == 128) {
+                // Inf or NaN
+                dst[i] = static_cast<uint16_t>((sign << 15) | 0x7C00 | (mant ? 0x200 : 0));
+            } else if (exp > 15) {
+                // Overflow → Inf
+                dst[i] = static_cast<uint16_t>((sign << 15) | 0x7C00);
+            } else if (exp < -14) {
+                // Underflow → zero or denorm
+                if (exp >= -24) {
+                    // Denormalized
+                    mant = (mant | 0x800000) >> (-exp - 14 + 1);
+                    dst[i] = static_cast<uint16_t>((sign << 15) | (mant >> 13));
+                } else {
+                    // Zero
+                    dst[i] = static_cast<uint16_t>(sign << 15);
+                }
+            } else {
+                // Normal case
+                dst[i] = static_cast<uint16_t>(
+                    (sign << 15) |
+                    ((exp + 15) << 10) |
+                    (mant >> 13)
+                );
+            }
+        }
+
+        data = std::move(new_data);
         dtype = DType::F16;
     }
 };

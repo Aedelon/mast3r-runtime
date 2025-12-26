@@ -6,6 +6,8 @@ set(METAL_SHADERS
     attention
     matching
     topk_sort
+    vit
+    dpt_heads
 )
 
 set(METAL_AIR_FILES)
@@ -36,10 +38,12 @@ add_custom_target(metal_shaders DEPENDS ${CMAKE_CURRENT_BINARY_DIR}/mast3r.metal
 add_library(mast3r_metal_impl STATIC
     metal_context.mm
     metal_engine.mm
+    vit_buffers.mm
 )
 
 target_include_directories(mast3r_metal_impl PUBLIC
     ${CMAKE_CURRENT_SOURCE_DIR}
+    ${CMAKE_CURRENT_SOURCE_DIR}/..
 )
 
 target_link_libraries(mast3r_metal_impl PUBLIC
