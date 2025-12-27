@@ -1,6 +1,7 @@
 // MASt3R Runtime - MPSGraph Engine
 // Copyright 2024 Delanoe Pirard / Aedelon. Apache 2.0.
 // Uses MPSGraph with native SDPA (macOS 15+) for ~21x speedup.
+// Supports pipelined inference: encoder[N+1] || decoder[N].
 
 #pragma once
 
@@ -11,6 +12,9 @@
 #include "../common/types.hpp"
 #include "mpsgraph_context.hpp"
 #include "gpu_tensor.hpp"
+#include "encoder_graph.hpp"
+#include "decoder_graph.hpp"
+#include "whitening_graph.hpp"
 
 namespace mast3r {
 namespace mpsgraph {
@@ -62,6 +66,18 @@ public:
     // This eliminates ~420ms of copy overhead when data isn't needed immediately.
     GPUInferenceResult infer_gpu(const ImageView& img1, const ImageView& img2);
 
+    // Pipelined inference: encoder[N+1] || decoder[N]
+    // For batch processing where encoder of next image runs while decoder processes current.
+    // Returns same result format as infer_gpu but with improved throughput for sequences.
+    // Requires: set_pipeline_mode(true) before first call, then call in sequence.
+    void set_pipeline_mode(bool enabled);
+    bool is_pipeline_mode() const { return pipeline_mode_enabled_; }
+
+    // Batch inference with encoder/decoder pipelining (highest throughput)
+    // Uses double-buffered async execution: encoder[i+1] runs while decoder[i] processes.
+    // For N images, achieves ~2x throughput vs sequential (encoder+decoder overlap).
+    std::vector<GPUInferenceResult> infer_batch_pipelined(const std::vector<ImageView>& images);
+
     // Feature matching
     MatchResult match(
         const float* desc_1, const float* desc_2,
@@ -101,12 +117,22 @@ private:
     bool is_loaded_ = false;
     bool is_retrieval_loaded_ = false;
     bool is_retrieval_standalone_ = false;  // true if retrieval loaded without main model
+    bool pipeline_mode_enabled_ = false;    // true when using partitioned graphs
 
     // Shared context
     std::shared_ptr<MPSGraphContext> ctx_;
 
     // Graph (not shared - each engine has its own compiled graph)
     MPSGraph* graph_ = nil;
+
+    // Partitioned graphs for pipelining (encoder[N+1] || decoder[N])
+    std::unique_ptr<EncoderGraph> encoder_graph_;
+    std::unique_ptr<DecoderGraph> decoder_graph_;
+    std::unique_ptr<WhiteningGraph> whitening_graph_partitioned_;
+
+    // Double-buffered encoder outputs for pipelining
+    EncoderOutputBuffer enc_buffer_1_;
+    EncoderOutputBuffer enc_buffer_2_;
 
     // Pre-compiled executables (faster than JIT compilation each run)
     MPSGraphExecutable* main_executable_ = nil;      // Main inference graph

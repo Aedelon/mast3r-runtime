@@ -10,6 +10,10 @@ add_library(mast3r_mps_impl STATIC
     mpsgraph_context.mm
     mpsgraph_engine.mm
     gpu_tensor.mm
+    # Partitioned graphs for pipelining
+    encoder_graph.mm
+    decoder_graph.mm
+    whitening_graph.mm
 )
 
 target_include_directories(mast3r_mps_impl PUBLIC

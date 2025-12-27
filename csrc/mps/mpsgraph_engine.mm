@@ -5,311 +5,15 @@
 
 #import "mpsgraph_engine.hpp"
 #import "mpsgraph_context.hpp"
+#import "graph_builder.hpp"
 #include "../common/safetensors.hpp"
 #include <cmath>
 #include <chrono>
 #include <cstring>
+#include <filesystem>
 
 namespace mast3r {
 namespace mpsgraph {
-
-// ============================================================================
-// Model Configuration
-// ============================================================================
-
-struct ModelConfig {
-    // Architecture
-    int patch_size;
-    bool is_dune;  // DUNE vs MASt3R architecture
-
-    // Encoder
-    int enc_dim;
-    int enc_heads;
-    int enc_head_dim;
-    int enc_mlp;
-    int enc_depth;
-
-    // Decoder
-    int dec_dim;
-    int dec_heads;
-    int dec_head_dim;
-    int dec_mlp;
-    int dec_depth;
-
-    // Output
-    int desc_dim;
-    int lf_hidden;  // local features hidden dim
-
-    // Weight prefixes (different for DUNE vs MASt3R)
-    // MASt3R: patch_embed.proj, enc_blocks.X, dec_blocks.X, downstream_head1
-    // DUNE:   encoder.patch_embed.proj, encoder.blocks.0.X, mast3r.dec_blocks.X, mast3r.downstream_head1
-
-    std::string enc_block_key(int i) const {
-        if (is_dune) {
-            // DUNE: encoder.blocks.0.X (note the extra .0.)
-            return "encoder.blocks.0." + std::to_string(i) + ".";
-        } else {
-            return "enc_blocks." + std::to_string(i) + ".";
-        }
-    }
-
-    std::string dec_block_key(int i) const {
-        if (is_dune) {
-            return "mast3r.dec_blocks." + std::to_string(i) + ".";
-        } else {
-            return "dec_blocks." + std::to_string(i) + ".";
-        }
-    }
-
-    std::string patch_embed_key() const {
-        return is_dune ? "encoder.patch_embed.proj." : "patch_embed.proj.";
-    }
-
-    std::string enc_norm_key() const {
-        return is_dune ? "encoder.norm." : "enc_norm.";
-    }
-
-    std::string decoder_embed_key() const {
-        return is_dune ? "mast3r.decoder_embed." : "decoder_embed.";
-    }
-
-    std::string head_key() const {
-        return is_dune ? "mast3r.downstream_head1." : "downstream_head1.";
-    }
-
-    static ModelConfig mast3r_vit_large() {
-        return {
-            .patch_size = 16,
-            .is_dune = false,
-            .enc_dim = 1024, .enc_heads = 16, .enc_head_dim = 64, .enc_mlp = 4096, .enc_depth = 24,
-            .dec_dim = 768, .dec_heads = 12, .dec_head_dim = 64, .dec_mlp = 3072, .dec_depth = 12,
-            .desc_dim = 24,
-            .lf_hidden = 7168
-        };
-    }
-
-    static ModelConfig dune_vit_small() {
-        return {
-            .patch_size = 14,
-            .is_dune = true,
-            .enc_dim = 384, .enc_heads = 6, .enc_head_dim = 64, .enc_mlp = 1536, .enc_depth = 12,
-            .dec_dim = 768, .dec_heads = 12, .dec_head_dim = 64, .dec_mlp = 3072, .dec_depth = 12,
-            .desc_dim = 24,
-            .lf_hidden = 4096
-        };
-    }
-
-    static ModelConfig dune_vit_base() {
-        return {
-            .patch_size = 14,
-            .is_dune = true,
-            .enc_dim = 768, .enc_heads = 12, .enc_head_dim = 64, .enc_mlp = 3072, .enc_depth = 12,
-            .dec_dim = 768, .dec_heads = 12, .dec_head_dim = 64, .dec_mlp = 3072, .dec_depth = 12,
-            .desc_dim = 24,
-            .lf_hidden = 4096
-        };
-    }
-
-    static ModelConfig from_variant(ModelVariant variant) {
-        switch (variant) {
-            case ModelVariant::MAST3R_VIT_LARGE:
-                return mast3r_vit_large();
-            case ModelVariant::DUNE_VIT_SMALL_336:
-            case ModelVariant::DUNE_VIT_SMALL_448:
-                return dune_vit_small();
-            case ModelVariant::DUNE_VIT_BASE_336:
-            case ModelVariant::DUNE_VIT_BASE_448:
-                return dune_vit_base();
-            default:
-                return dune_vit_small();
-        }
-    }
-};
-
-constexpr float LN_EPS = 1e-6f;
-
-// ============================================================================
-// Graph Builder Helper
-// ============================================================================
-
-class API_AVAILABLE(macos(15.0)) GraphBuilder {
-public:
-    MPSGraph* graph_;
-    id<MTLDevice> device_;
-    safetensors::MultiSafetensorsFile* files_;
-    MPSDataType dtype_;  // FP32 or FP16 for compute
-
-    GraphBuilder(MPSGraph* graph, id<MTLDevice> device, safetensors::MultiSafetensorsFile* files,
-                 bool use_fp16 = false)
-        : graph_(graph), device_(device), files_(files),
-          dtype_(use_fp16 ? MPSDataTypeFloat16 : MPSDataTypeFloat32) {}
-
-    MPSGraphTensor* load(const std::string& name, NSArray<NSNumber*>* shape) {
-        auto data = files_->load_tensor_f32(name);
-        NSData* nsdata = [NSData dataWithBytes:data.data() length:data.size() * sizeof(float)];
-        MPSGraphTensor* t = [graph_ constantWithData:nsdata shape:shape dataType:MPSDataTypeFloat32];
-        // Cast to FP16 if needed
-        if (dtype_ == MPSDataTypeFloat16) {
-            t = [graph_ castTensor:t toType:MPSDataTypeFloat16 name:nil];
-        }
-        return t;
-    }
-
-    bool has_weight(const std::string& name) {
-        return files_->has_tensor(name);
-    }
-
-    MPSGraphTensor* layer_norm(MPSGraphTensor* x, MPSGraphTensor* w, MPSGraphTensor* b) {
-        MPSGraphTensor* mean = [graph_ meanOfTensor:x axes:@[@(-1)] name:nil];
-        MPSGraphTensor* centered = [graph_ subtractionWithPrimaryTensor:x secondaryTensor:mean name:nil];
-        MPSGraphTensor* var = [graph_ meanOfTensor:[graph_ squareWithTensor:centered name:nil] axes:@[@(-1)] name:nil];
-        MPSGraphTensor* eps = [graph_ constantWithScalar:LN_EPS shape:@[@1] dataType:dtype_];
-        MPSGraphTensor* std = [graph_ squareRootWithTensor:[graph_ additionWithPrimaryTensor:var secondaryTensor:eps name:nil] name:nil];
-        MPSGraphTensor* norm = [graph_ divisionWithPrimaryTensor:centered secondaryTensor:std name:nil];
-        norm = [graph_ multiplicationWithPrimaryTensor:norm secondaryTensor:w name:nil];
-        return [graph_ additionWithPrimaryTensor:norm secondaryTensor:b name:nil];
-    }
-
-    MPSGraphTensor* gelu(MPSGraphTensor* x) {
-        MPSGraphTensor* inv_sqrt2 = [graph_ constantWithScalar:0.7071067811865475 shape:@[@1] dataType:dtype_];
-        MPSGraphTensor* half = [graph_ constantWithScalar:0.5 shape:@[@1] dataType:dtype_];
-        MPSGraphTensor* one = [graph_ constantWithScalar:1.0 shape:@[@1] dataType:dtype_];
-        MPSGraphTensor* cdf = [graph_ multiplicationWithPrimaryTensor:half
-                                  secondaryTensor:[graph_ additionWithPrimaryTensor:one
-                                                      secondaryTensor:[graph_ erfWithTensor:
-                                                          [graph_ multiplicationWithPrimaryTensor:x secondaryTensor:inv_sqrt2 name:nil] name:nil] name:nil] name:nil];
-        return [graph_ multiplicationWithPrimaryTensor:x secondaryTensor:cdf name:nil];
-    }
-
-    MPSGraphTensor* linear(MPSGraphTensor* x, MPSGraphTensor* w, MPSGraphTensor* b) {
-        MPSGraphTensor* wt = [graph_ transposeTensor:w dimension:0 withDimension:1 name:nil];
-        MPSGraphTensor* out = [graph_ matrixMultiplicationWithPrimaryTensor:x secondaryTensor:wt name:nil];
-        if (b) out = [graph_ additionWithPrimaryTensor:out secondaryTensor:b name:nil];
-        return out;
-    }
-
-    MPSGraphTensor* self_attention(MPSGraphTensor* x, MPSGraphTensor* qkv_w, MPSGraphTensor* qkv_b,
-                                   MPSGraphTensor* proj_w, MPSGraphTensor* proj_b, int heads, int head_dim) {
-        int dim = heads * head_dim;
-        float scale = 1.0f / sqrtf((float)head_dim);
-        MPSGraphTensor* qkv = linear(x, qkv_w, qkv_b);
-        NSArray<MPSGraphTensor*>* splits = [graph_ splitTensor:qkv numSplits:3 axis:-1 name:nil];
-        NSArray<NSNumber*>* shape = @[@1, @(heads), @(-1), @(head_dim)];
-        MPSGraphTensor* Q = [graph_ reshapeTensor:splits[0] withShape:shape name:nil];
-        MPSGraphTensor* K = [graph_ reshapeTensor:splits[1] withShape:shape name:nil];
-        MPSGraphTensor* V = [graph_ reshapeTensor:splits[2] withShape:shape name:nil];
-        MPSGraphTensor* attn = [graph_ scaledDotProductAttentionWithQueryTensor:Q keyTensor:K valueTensor:V maskTensor:nil scale:scale name:nil];
-        attn = [graph_ reshapeTensor:attn withShape:@[@(-1), @(dim)] name:nil];
-        return linear(attn, proj_w, proj_b);
-    }
-
-    MPSGraphTensor* cross_attention(MPSGraphTensor* x, MPSGraphTensor* y,
-                                    MPSGraphTensor* q_w, MPSGraphTensor* q_b,
-                                    MPSGraphTensor* k_w, MPSGraphTensor* k_b,
-                                    MPSGraphTensor* v_w, MPSGraphTensor* v_b,
-                                    MPSGraphTensor* proj_w, MPSGraphTensor* proj_b, int heads, int head_dim) {
-        int dim = heads * head_dim;
-        float scale = 1.0f / sqrtf((float)head_dim);
-        MPSGraphTensor* Q = linear(x, q_w, q_b);
-        MPSGraphTensor* K = linear(y, k_w, k_b);
-        MPSGraphTensor* V = linear(y, v_w, v_b);
-        NSArray<NSNumber*>* shape = @[@1, @(heads), @(-1), @(head_dim)];
-        Q = [graph_ reshapeTensor:Q withShape:shape name:nil];
-        K = [graph_ reshapeTensor:K withShape:shape name:nil];
-        V = [graph_ reshapeTensor:V withShape:shape name:nil];
-        MPSGraphTensor* attn = [graph_ scaledDotProductAttentionWithQueryTensor:Q keyTensor:K valueTensor:V maskTensor:nil scale:scale name:nil];
-        attn = [graph_ reshapeTensor:attn withShape:@[@(-1), @(dim)] name:nil];
-        return linear(attn, proj_w, proj_b);
-    }
-
-    MPSGraphTensor* conv2d(MPSGraphTensor* x, MPSGraphTensor* w, MPSGraphTensor* b, int stride=1, int pad=0) {
-        MPSGraphConvolution2DOpDescriptor* desc = [MPSGraphConvolution2DOpDescriptor
-            descriptorWithStrideInX:stride strideInY:stride dilationRateInX:1 dilationRateInY:1 groups:1
-                       paddingStyle:MPSGraphPaddingStyleExplicit dataLayout:MPSGraphTensorNamedDataLayoutNHWC
-                      weightsLayout:MPSGraphTensorNamedDataLayoutOIHW];
-        desc.paddingLeft = pad; desc.paddingRight = pad; desc.paddingTop = pad; desc.paddingBottom = pad;
-        MPSGraphTensor* out = [graph_ convolution2DWithSourceTensor:x weightsTensor:w descriptor:desc name:nil];
-        if (b) out = [graph_ additionWithPrimaryTensor:out secondaryTensor:b name:nil];
-        return out;
-    }
-
-    MPSGraphTensor* conv_transpose2d(MPSGraphTensor* x, MPSGraphTensor* w, MPSGraphTensor* b, int stride) {
-        MPSGraphConvolution2DOpDescriptor* desc = [MPSGraphConvolution2DOpDescriptor
-            descriptorWithStrideInX:stride strideInY:stride dilationRateInX:1 dilationRateInY:1 groups:1
-                       paddingStyle:MPSGraphPaddingStyleExplicit dataLayout:MPSGraphTensorNamedDataLayoutNHWC
-                      weightsLayout:MPSGraphTensorNamedDataLayoutOIHW];
-        int pad = (stride - 1) / 2;
-        desc.paddingLeft = pad; desc.paddingRight = pad; desc.paddingTop = pad; desc.paddingBottom = pad;
-        NSArray<NSNumber*>* x_shape = [x shape];
-        int in_h = [x_shape[1] intValue], in_w = [x_shape[2] intValue], out_c = [[w shape][1] intValue];
-        NSArray<NSNumber*>* out_shape = @[@1, @(in_h * stride), @(in_w * stride), @(out_c)];
-        MPSGraphTensor* wt = [graph_ transposeTensor:w dimension:0 withDimension:1 name:nil];
-        MPSGraphTensor* out = [graph_ convolutionTranspose2DWithSourceTensor:x weightsTensor:wt outputShape:out_shape descriptor:desc name:nil];
-        if (b) out = [graph_ additionWithPrimaryTensor:out secondaryTensor:b name:nil];
-        return out;
-    }
-
-    MPSGraphTensor* upsample(MPSGraphTensor* x, int scale) {
-        NSArray<NSNumber*>* shape = [x shape];
-        int h = [shape[1] intValue], w = [shape[2] intValue];
-        return [graph_ resizeTensor:x size:@[@(h*scale), @(w*scale)] mode:MPSGraphResizeBilinear
-                       centerResult:YES alignCorners:NO layout:MPSGraphTensorNamedDataLayoutNHWC name:nil];
-    }
-
-    MPSGraphTensor* relu(MPSGraphTensor* x) { return [graph_ reLUWithTensor:x name:nil]; }
-
-    MPSGraphTensor* add(MPSGraphTensor* a, MPSGraphTensor* b) {
-        return [graph_ additionWithPrimaryTensor:a secondaryTensor:b name:nil];
-    }
-
-    MPSGraphTensor* pixel_shuffle(MPSGraphTensor* x, int r) {
-        NSArray<NSNumber*>* shape = [x shape];
-        int pH = [shape[1] intValue], pW = [shape[2] intValue], C_rr = [shape[3] intValue];
-        int C = C_rr / (r * r);
-        MPSGraphTensor* reshaped = [graph_ reshapeTensor:x withShape:@[@1, @(pH), @(pW), @(r), @(r), @(C)] name:nil];
-        reshaped = [graph_ transposeTensor:reshaped dimension:2 withDimension:3 name:nil];
-        return [graph_ reshapeTensor:reshaped withShape:@[@1, @(pH*r), @(pW*r), @(C)] name:nil];
-    }
-
-    MPSGraphTensor* l2_norm(MPSGraphTensor* x) {
-        MPSGraphTensor* sq = [graph_ squareWithTensor:x name:nil];
-        MPSGraphTensor* sum = [graph_ reductionSumWithTensor:sq axis:-1 name:nil];
-        MPSGraphTensor* eps = [graph_ constantWithScalar:1e-8 shape:@[@1] dataType:dtype_];
-        MPSGraphTensor* norm = [graph_ squareRootWithTensor:[graph_ additionWithPrimaryTensor:sum secondaryTensor:eps name:nil] name:nil];
-        return [graph_ divisionWithPrimaryTensor:x secondaryTensor:norm name:nil];
-    }
-
-    // GPU-based ImageNet normalization: (x / 255 - mean) / std
-    // Input: uint8 [B, H, W, 3], Output: dtype_ [B, H, W, 3]
-    MPSGraphTensor* imagenet_normalize(MPSGraphTensor* x) {
-        // Cast to float32 for precision in normalization math
-        MPSGraphTensor* xf = [graph_ castTensor:x toType:MPSDataTypeFloat32 name:nil];
-
-        // Divide by 255
-        MPSGraphTensor* inv255 = [graph_ constantWithScalar:1.0f/255.0f shape:@[@1] dataType:MPSDataTypeFloat32];
-        xf = [graph_ multiplicationWithPrimaryTensor:xf secondaryTensor:inv255 name:nil];
-
-        // ImageNet mean and inv_std per channel: [1, 1, 1, 3]
-        float mean_vals[3] = {0.485f, 0.456f, 0.406f};
-        float inv_std_vals[3] = {1.0f/0.229f, 1.0f/0.224f, 1.0f/0.225f};
-
-        NSData* mean_data = [NSData dataWithBytes:mean_vals length:3 * sizeof(float)];
-        NSData* inv_std_data = [NSData dataWithBytes:inv_std_vals length:3 * sizeof(float)];
-
-        MPSGraphTensor* mean = [graph_ constantWithData:mean_data shape:@[@1, @1, @1, @3] dataType:MPSDataTypeFloat32];
-        MPSGraphTensor* inv_std = [graph_ constantWithData:inv_std_data shape:@[@1, @1, @1, @3] dataType:MPSDataTypeFloat32];
-
-        // (x - mean) * inv_std
-        xf = [graph_ subtractionWithPrimaryTensor:xf secondaryTensor:mean name:nil];
-        xf = [graph_ multiplicationWithPrimaryTensor:xf secondaryTensor:inv_std name:nil];
-
-        // Cast to dtype_ (FP16 or FP32) for model compute
-        if (dtype_ == MPSDataTypeFloat16) {
-            xf = [graph_ castTensor:xf toType:MPSDataTypeFloat16 name:nil];
-        }
-        return xf;
-    }
-};
 
 // ============================================================================
 // MPSGraphEngine Implementation
@@ -352,17 +56,24 @@ void MPSGraphEngine::load(const std::string& model_path) {
             safetensors::MultiSafetensorsFile files;
 
             // Check if path is a directory (DUNE) or single file (MASt3R)
-            std::ifstream test_file(model_path);
-            if (test_file.good()) {
+            // NOTE: std::ifstream::good() returns true for directories on macOS, so use std::filesystem
+            if (std::filesystem::is_regular_file(model_path)) {
                 // Single file - extract directory and add all files
                 std::string dir = model_path.substr(0, model_path.rfind('/'));
                 files.add_directory(dir);
-            } else {
+            } else if (std::filesystem::is_directory(model_path)) {
                 // Directory path
                 files.add_directory(model_path);
+            } else {
+                throw std::runtime_error("Model path does not exist: " + model_path);
             }
 
+            // Debug: print loaded tensor info
+            NSLog(@"[MPSGraphEngine] Loaded %zu files with %zu tensors from %s",
+                  files.num_files(), files.num_tensors(), model_path.c_str());
+
             ModelConfig cfg = ModelConfig::from_variant(config_.variant);
+            NSLog(@"[MPSGraphEngine] Looking for patch_embed key: %s", cfg.patch_embed_key().c_str());
 
             // Get image dimensions from config
             const int IMG_H = config_.resolution;
@@ -1148,12 +859,13 @@ void MPSGraphEngine::load_retrieval(const std::string& model_path, const std::st
 
                 // Load encoder weights from model file
                 safetensors::MultiSafetensorsFile files;
-                std::ifstream test_file(model_path);
-                if (test_file.good()) {
+                if (std::filesystem::is_regular_file(model_path)) {
                     std::string dir = model_path.substr(0, model_path.rfind('/'));
                     files.add_directory(dir);
-                } else {
+                } else if (std::filesystem::is_directory(model_path)) {
                     files.add_directory(model_path);
+                } else {
+                    throw std::runtime_error("Model path does not exist: " + model_path);
                 }
 
                 retrieval_graph_ = ctx_->create_graph();
@@ -1190,13 +902,30 @@ void MPSGraphEngine::load_retrieval(const std::string& model_path, const std::st
                     };
                 }
 
-                // Whitening weights
-                MPSGraphTensor* whiten_m = [retrieval_graph_ constantWithData:m_nsdata
+                // Whitening weights - must match encoder precision
+                MPSDataType dtype = use_fp16 ? MPSDataTypeFloat16 : MPSDataTypeFloat32;
+                NSData* m_data_final = m_nsdata;
+                NSData* p_data_final = p_nsdata;
+                if (use_fp16) {
+                    // Convert FP32 weights to FP16
+                    size_t m_count = cfg.enc_dim;
+                    size_t p_count = cfg.enc_dim * cfg.enc_dim;
+                    std::vector<__fp16> m_fp16(m_count);
+                    std::vector<__fp16> p_fp16(p_count);
+                    const float* m_ptr = static_cast<const float*>(m_nsdata.bytes);
+                    const float* p_ptr = static_cast<const float*>(p_nsdata.bytes);
+                    for (size_t i = 0; i < m_count; i++) m_fp16[i] = static_cast<__fp16>(m_ptr[i]);
+                    for (size_t i = 0; i < p_count; i++) p_fp16[i] = static_cast<__fp16>(p_ptr[i]);
+                    m_data_final = [NSData dataWithBytes:m_fp16.data() length:m_count * sizeof(__fp16)];
+                    p_data_final = [NSData dataWithBytes:p_fp16.data() length:p_count * sizeof(__fp16)];
+                }
+
+                MPSGraphTensor* whiten_m = [retrieval_graph_ constantWithData:m_data_final
                                                                         shape:@[@1, @(cfg.enc_dim)]
-                                                                     dataType:MPSDataTypeFloat32];
-                MPSGraphTensor* whiten_p = [retrieval_graph_ constantWithData:p_nsdata
+                                                                     dataType:dtype];
+                MPSGraphTensor* whiten_p = [retrieval_graph_ constantWithData:p_data_final
                                                                         shape:@[@(cfg.enc_dim), @(cfg.enc_dim)]
-                                                                     dataType:MPSDataTypeFloat32];
+                                                                     dataType:dtype];
 
                 // Build graph: input → encoder → whitening → attention
                 retrieval_input_ = [retrieval_graph_ placeholderWithShape:@[@1, @(IMG_H), @(IMG_W), @3]
@@ -1231,16 +960,27 @@ void MPSGraphEngine::load_retrieval(const std::string& model_path, const std::st
                                                                           secondaryTensor:whiten_m name:nil];
                 MPSGraphTensor* whitened = [retrieval_graph_ matrixMultiplicationWithPrimaryTensor:centered
                                                                                    secondaryTensor:whiten_p name:nil];
-                retrieval_features_ = whitened;  // [N, D]
 
-                // L2 attention: ||x||² / sum(||x||²)
+                // Cast to FP32 for output (retrieval features need FP32 for downstream)
+                if (use_fp16) {
+                    retrieval_features_ = [retrieval_graph_ castTensor:whitened toType:MPSDataTypeFloat32 name:nil];
+                } else {
+                    retrieval_features_ = whitened;  // [N, D]
+                }
+
+                // L2 attention: ||x||² / sum(||x||²) - compute in native precision, output FP32
                 MPSGraphTensor* sq = [retrieval_graph_ squareWithTensor:whitened name:nil];
                 MPSGraphTensor* l2_sq = [retrieval_graph_ reductionSumWithTensor:sq axis:-1 name:nil];
                 MPSGraphTensor* total = [retrieval_graph_ reductionSumWithTensor:l2_sq axes:@[@0] name:nil];
                 total = [retrieval_graph_ reshapeTensor:total withShape:@[@1] name:nil];
-                MPSGraphTensor* eps = [retrieval_graph_ constantWithScalar:1e-8 shape:@[@1] dataType:MPSDataTypeFloat32];
+                MPSGraphTensor* eps = [retrieval_graph_ constantWithScalar:1e-8 shape:@[@1] dataType:dtype];
                 total = [retrieval_graph_ additionWithPrimaryTensor:total secondaryTensor:eps name:nil];
-                retrieval_attention_ = [retrieval_graph_ divisionWithPrimaryTensor:l2_sq secondaryTensor:total name:nil];
+                MPSGraphTensor* attn = [retrieval_graph_ divisionWithPrimaryTensor:l2_sq secondaryTensor:total name:nil];
+                if (use_fp16) {
+                    retrieval_attention_ = [retrieval_graph_ castTensor:attn toType:MPSDataTypeFloat32 name:nil];
+                } else {
+                    retrieval_attention_ = attn;
+                }
 
                 is_retrieval_standalone_ = true;
             }
@@ -1504,6 +1244,163 @@ std::vector<RetrievalResult> MPSGraphEngine::encode_retrieval_batch(const std::v
             for (size_t i = 0; i < N; i++) {
                 results[i].total_ms = per_image_ms;
                 results[i].encoder_ms = per_image_ms;  // Approximation for batch
+            }
+        }
+    }
+
+    return results;
+}
+
+// ============================================================================
+// Pipelined Inference (encoder[N+1] || decoder[N])
+// ============================================================================
+
+void MPSGraphEngine::set_pipeline_mode(bool enabled) {
+    if (enabled == pipeline_mode_enabled_) return;
+
+    if (enabled) {
+        if (@available(macOS 15.0, *)) {
+            @autoreleasepool {
+                // Create partitioned graphs
+                encoder_graph_ = std::make_unique<EncoderGraph>(ctx_, config_);
+                decoder_graph_ = std::make_unique<DecoderGraph>(ctx_, config_);
+
+                // Load weights from same model path (reuse loaded weights concept)
+                // Note: This requires model to be loaded first
+                if (!is_loaded_) {
+                    throw std::runtime_error("Pipeline mode requires model to be loaded first");
+                }
+
+                // The partitioned graphs need their weights loaded
+                // For now, we'll need to track model path or reload
+                // TODO: Optimize by sharing weight tensors between graphs
+
+                pipeline_mode_enabled_ = true;
+            }
+        }
+    } else {
+        encoder_graph_.reset();
+        decoder_graph_.reset();
+        enc_buffer_1_ = {};
+        enc_buffer_2_ = {};
+        pipeline_mode_enabled_ = false;
+    }
+}
+
+std::vector<GPUInferenceResult> MPSGraphEngine::infer_batch_pipelined(const std::vector<ImageView>& images) {
+    std::vector<GPUInferenceResult> results(images.size());
+
+    if (images.empty()) return results;
+
+    if (!is_loaded_) {
+        throw std::runtime_error("Model not loaded");
+    }
+
+    if (@available(macOS 15.0, *)) {
+        @autoreleasepool {
+            auto total_start = std::chrono::high_resolution_clock::now();
+
+            const size_t N = images.size();
+            const int IMG_H = config_.resolution;
+            const int IMG_W = static_cast<int>(config_.resolution * 4.0f / 3.0f);
+
+            // For now, use the monolithic graph with full async overlap
+            // This still achieves good parallelism by running multiple images concurrently
+
+            // Create input tensors
+            std::vector<MPSGraphTensorData*> input_tds(N);
+            MPSNDArrayDescriptor* desc = [MPSNDArrayDescriptor descriptorWithDataType:MPSDataTypeUInt8
+                                                                                shape:@[@1, @(IMG_H), @(IMG_W), @3]];
+
+            for (size_t i = 0; i < N; i++) {
+                MPSNDArray* arr = [[MPSNDArray alloc] initWithDevice:ctx_->device() descriptor:desc];
+                [arr writeBytes:(void*)images[i].data strideBytes:nil];
+                input_tds[i] = [[MPSGraphTensorData alloc] initWithMPSNDArray:arr];
+            }
+
+            // Pre-allocate all output buffers
+            ModelConfig cfg = ModelConfig::from_variant(config_.variant);
+            const size_t pts3d_elements = IMG_H * IMG_W * 3;
+            const size_t conf_elements = IMG_H * IMG_W;
+            const size_t desc_elements = IMG_H * IMG_W * cfg.desc_dim;
+
+            std::vector<id<MTLBuffer>> bufs_pts3d(N);
+            std::vector<id<MTLBuffer>> bufs_conf(N);
+            std::vector<id<MTLBuffer>> bufs_desc(N);
+            std::vector<MPSGraphTensorData*> tds_pts3d(N);
+            std::vector<MPSGraphTensorData*> tds_conf(N);
+            std::vector<MPSGraphTensorData*> tds_desc(N);
+
+            for (size_t i = 0; i < N; i++) {
+                bufs_pts3d[i] = [ctx_->device() newBufferWithLength:pts3d_elements * sizeof(float)
+                                                            options:MTLResourceStorageModeShared];
+                bufs_conf[i] = [ctx_->device() newBufferWithLength:conf_elements * sizeof(float)
+                                                           options:MTLResourceStorageModeShared];
+                bufs_desc[i] = [ctx_->device() newBufferWithLength:desc_elements * sizeof(float)
+                                                           options:MTLResourceStorageModeShared];
+
+                tds_pts3d[i] = [[MPSGraphTensorData alloc] initWithMTLBuffer:bufs_pts3d[i]
+                                                                       shape:@[@1, @(IMG_H), @(IMG_W), @3]
+                                                                    dataType:MPSDataTypeFloat32];
+                tds_conf[i] = [[MPSGraphTensorData alloc] initWithMTLBuffer:bufs_conf[i]
+                                                                      shape:@[@1, @(IMG_H), @(IMG_W)]
+                                                                   dataType:MPSDataTypeFloat32];
+                tds_desc[i] = [[MPSGraphTensorData alloc] initWithMTLBuffer:bufs_desc[i]
+                                                                      shape:@[@1, @(IMG_H), @(IMG_W), @(cfg.desc_dim)]
+                                                                   dataType:MPSDataTypeFloat32];
+            }
+
+            // Launch all async with semaphores
+            std::vector<dispatch_semaphore_t> semaphores(N);
+            for (size_t i = 0; i < N; i++) {
+                semaphores[i] = dispatch_semaphore_create(0);
+
+                NSDictionary* feeds = @{input_placeholder_: input_tds[i]};
+                NSDictionary* resultsDict = @{
+                    output_pts3d_: tds_pts3d[i],
+                    output_conf_: tds_conf[i],
+                    output_descriptors_: tds_desc[i]
+                };
+
+                MPSGraphExecutionDescriptor* execDesc = [[MPSGraphExecutionDescriptor alloc] init];
+                dispatch_semaphore_t sem = semaphores[i];
+                execDesc.completionHandler = ^(NSDictionary<MPSGraphTensor*, MPSGraphTensorData*>* res, NSError* err) {
+                    dispatch_semaphore_signal(sem);
+                };
+
+                [graph_ runAsyncWithMTLCommandQueue:ctx_->queue()
+                                              feeds:feeds
+                                   targetOperations:nil
+                                  resultsDictionary:resultsDict
+                                executionDescriptor:execDesc];
+            }
+
+            // Wait and collect results
+            for (size_t i = 0; i < N; i++) {
+                dispatch_semaphore_wait(semaphores[i], DISPATCH_TIME_FOREVER);
+
+                results[i].height = IMG_H;
+                results[i].width = IMG_W;
+                results[i].desc_dim = spec_.desc_dim;
+
+                results[i].pts3d_1 = GPUTensor::from_tensor_data(tds_pts3d[i], {1, IMG_H, IMG_W, 3});
+                results[i].conf_1 = GPUTensor::from_tensor_data(tds_conf[i], {1, IMG_H, IMG_W});
+                results[i].desc_1 = GPUTensor::from_tensor_data(tds_desc[i], {1, IMG_H, IMG_W, static_cast<int64_t>(spec_.desc_dim)});
+
+                // For single image batch, pts3d_2/conf_2/desc_2 are not used
+                results[i].pts3d_2 = GPUTensor();
+                results[i].conf_2 = GPUTensor();
+                results[i].desc_2 = GPUTensor();
+            }
+
+            auto total_end = std::chrono::high_resolution_clock::now();
+            float total_ms = std::chrono::duration<double, std::milli>(total_end - total_start).count();
+            float per_image_ms = total_ms / N;
+
+            for (size_t i = 0; i < N; i++) {
+                results[i].preprocess_ms = 0.0;
+                results[i].inference_ms = per_image_ms;
+                results[i].total_ms = per_image_ms;
             }
         }
     }

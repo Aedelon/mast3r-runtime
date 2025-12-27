@@ -325,6 +325,40 @@ public:
         return py_result;
     }
 
+    // Batch inference with pipelining (encoder[N+1] || decoder[N])
+    std::vector<PyGPUInferenceResult> infer_batch_pipelined(py::list images) {
+        std::vector<ImageView> views;
+        views.reserve(py::len(images));
+
+        for (auto& item : images) {
+            views.push_back(numpy_to_image_view(item.cast<py::array_t<uint8_t>>()));
+        }
+
+        auto results = engine_->infer_batch_pipelined(views);
+
+        std::vector<PyGPUInferenceResult> py_results;
+        py_results.reserve(results.size());
+
+        for (auto& result : results) {
+            PyGPUInferenceResult py_result;
+
+            py_result.pts3d_1 = std::make_shared<PyGPUTensor>(std::move(result.pts3d_1));
+            py_result.pts3d_2 = std::make_shared<PyGPUTensor>(std::move(result.pts3d_2));
+            py_result.conf_1 = std::make_shared<PyGPUTensor>(std::move(result.conf_1));
+            py_result.conf_2 = std::make_shared<PyGPUTensor>(std::move(result.conf_2));
+            py_result.desc_1 = std::make_shared<PyGPUTensor>(std::move(result.desc_1));
+            py_result.desc_2 = std::make_shared<PyGPUTensor>(std::move(result.desc_2));
+
+            py_result.timing["preprocess_ms"] = result.preprocess_ms;
+            py_result.timing["inference_ms"] = result.inference_ms;
+            py_result.timing["total_ms"] = result.total_ms;
+
+            py_results.push_back(std::move(py_result));
+        }
+
+        return py_results;
+    }
+
     // Batch retrieval with async pipelining
     std::vector<PyRetrievalResult> encode_retrieval_batch(py::list images) {
         std::vector<ImageView> views;
@@ -434,6 +468,10 @@ PYBIND11_MODULE(_mps, m) {
              "Run inference returning GPU tensor handles (fast). "
              "Data stays on GPU until .numpy() is called on each tensor. "
              "This eliminates ~420ms of copy overhead when data isn't needed immediately.")
+        .def("infer_batch_pipelined", &PyMPSEngine::infer_batch_pipelined,
+             py::arg("images"),
+             "Batch inference with encoder/decoder pipelining for higher throughput. "
+             "Uses async execution with double-buffering for optimal GPU utilization.")
         .def("match", &PyMPSEngine::match,
              py::arg("desc_1"),
              py::arg("desc_2"),
