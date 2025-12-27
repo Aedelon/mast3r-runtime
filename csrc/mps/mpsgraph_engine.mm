@@ -136,14 +136,22 @@ public:
     MPSGraph* graph_;
     id<MTLDevice> device_;
     safetensors::MultiSafetensorsFile* files_;
+    MPSDataType dtype_;  // FP32 or FP16 for compute
 
-    GraphBuilder(MPSGraph* graph, id<MTLDevice> device, safetensors::MultiSafetensorsFile* files)
-        : graph_(graph), device_(device), files_(files) {}
+    GraphBuilder(MPSGraph* graph, id<MTLDevice> device, safetensors::MultiSafetensorsFile* files,
+                 bool use_fp16 = false)
+        : graph_(graph), device_(device), files_(files),
+          dtype_(use_fp16 ? MPSDataTypeFloat16 : MPSDataTypeFloat32) {}
 
     MPSGraphTensor* load(const std::string& name, NSArray<NSNumber*>* shape) {
         auto data = files_->load_tensor_f32(name);
         NSData* nsdata = [NSData dataWithBytes:data.data() length:data.size() * sizeof(float)];
-        return [graph_ constantWithData:nsdata shape:shape dataType:MPSDataTypeFloat32];
+        MPSGraphTensor* t = [graph_ constantWithData:nsdata shape:shape dataType:MPSDataTypeFloat32];
+        // Cast to FP16 if needed
+        if (dtype_ == MPSDataTypeFloat16) {
+            t = [graph_ castTensor:t toType:MPSDataTypeFloat16 name:nil];
+        }
+        return t;
     }
 
     bool has_weight(const std::string& name) {
@@ -154,7 +162,7 @@ public:
         MPSGraphTensor* mean = [graph_ meanOfTensor:x axes:@[@(-1)] name:nil];
         MPSGraphTensor* centered = [graph_ subtractionWithPrimaryTensor:x secondaryTensor:mean name:nil];
         MPSGraphTensor* var = [graph_ meanOfTensor:[graph_ squareWithTensor:centered name:nil] axes:@[@(-1)] name:nil];
-        MPSGraphTensor* eps = [graph_ constantWithScalar:LN_EPS shape:@[@1] dataType:MPSDataTypeFloat32];
+        MPSGraphTensor* eps = [graph_ constantWithScalar:LN_EPS shape:@[@1] dataType:dtype_];
         MPSGraphTensor* std = [graph_ squareRootWithTensor:[graph_ additionWithPrimaryTensor:var secondaryTensor:eps name:nil] name:nil];
         MPSGraphTensor* norm = [graph_ divisionWithPrimaryTensor:centered secondaryTensor:std name:nil];
         norm = [graph_ multiplicationWithPrimaryTensor:norm secondaryTensor:w name:nil];
@@ -162,9 +170,9 @@ public:
     }
 
     MPSGraphTensor* gelu(MPSGraphTensor* x) {
-        MPSGraphTensor* inv_sqrt2 = [graph_ constantWithScalar:0.7071067811865475 shape:@[@1] dataType:MPSDataTypeFloat32];
-        MPSGraphTensor* half = [graph_ constantWithScalar:0.5 shape:@[@1] dataType:MPSDataTypeFloat32];
-        MPSGraphTensor* one = [graph_ constantWithScalar:1.0 shape:@[@1] dataType:MPSDataTypeFloat32];
+        MPSGraphTensor* inv_sqrt2 = [graph_ constantWithScalar:0.7071067811865475 shape:@[@1] dataType:dtype_];
+        MPSGraphTensor* half = [graph_ constantWithScalar:0.5 shape:@[@1] dataType:dtype_];
+        MPSGraphTensor* one = [graph_ constantWithScalar:1.0 shape:@[@1] dataType:dtype_];
         MPSGraphTensor* cdf = [graph_ multiplicationWithPrimaryTensor:half
                                   secondaryTensor:[graph_ additionWithPrimaryTensor:one
                                                       secondaryTensor:[graph_ erfWithTensor:
@@ -265,15 +273,15 @@ public:
     MPSGraphTensor* l2_norm(MPSGraphTensor* x) {
         MPSGraphTensor* sq = [graph_ squareWithTensor:x name:nil];
         MPSGraphTensor* sum = [graph_ reductionSumWithTensor:sq axis:-1 name:nil];
-        MPSGraphTensor* eps = [graph_ constantWithScalar:1e-8 shape:@[@1] dataType:MPSDataTypeFloat32];
+        MPSGraphTensor* eps = [graph_ constantWithScalar:1e-8 shape:@[@1] dataType:dtype_];
         MPSGraphTensor* norm = [graph_ squareRootWithTensor:[graph_ additionWithPrimaryTensor:sum secondaryTensor:eps name:nil] name:nil];
         return [graph_ divisionWithPrimaryTensor:x secondaryTensor:norm name:nil];
     }
 
     // GPU-based ImageNet normalization: (x / 255 - mean) / std
-    // Input: uint8 [B, H, W, 3], Output: float32 [B, H, W, 3]
+    // Input: uint8 [B, H, W, 3], Output: dtype_ [B, H, W, 3]
     MPSGraphTensor* imagenet_normalize(MPSGraphTensor* x) {
-        // Cast to float32
+        // Cast to float32 for precision in normalization math
         MPSGraphTensor* xf = [graph_ castTensor:x toType:MPSDataTypeFloat32 name:nil];
 
         // Divide by 255
@@ -294,6 +302,10 @@ public:
         xf = [graph_ subtractionWithPrimaryTensor:xf secondaryTensor:mean name:nil];
         xf = [graph_ multiplicationWithPrimaryTensor:xf secondaryTensor:inv_std name:nil];
 
+        // Cast to dtype_ (FP16 or FP32) for model compute
+        if (dtype_ == MPSDataTypeFloat16) {
+            xf = [graph_ castTensor:xf toType:MPSDataTypeFloat16 name:nil];
+        }
         return xf;
     }
 };
@@ -358,7 +370,8 @@ void MPSGraphEngine::load(const std::string& model_path) {
             const int PATCH_W = IMG_W / cfg.patch_size;
             const int NUM_PATCHES = PATCH_H * PATCH_W;
 
-            GraphBuilder gb(graph_, ctx_->device(), &files);
+            bool use_fp16 = (config_.precision == Precision::FP16);
+            GraphBuilder gb(graph_, ctx_->device(), &files, use_fp16);
 
             // ================================================================
             // Load weights using ModelConfig methods
@@ -522,7 +535,12 @@ void MPSGraphEngine::load(const std::string& model_path) {
             MPSGraphTensor* enc_out = x;
 
             // Expose encoder output for retrieval (weight sharing)
-            output_enc_features_ = enc_out;  // [N, D] where D=enc_dim
+            // Cast to FP32 for compatibility with whitening graph
+            if (use_fp16) {
+                output_enc_features_ = [graph_ castTensor:enc_out toType:MPSDataTypeFloat32 name:nil];
+            } else {
+                output_enc_features_ = enc_out;  // [N, D] where D=enc_dim
+            }
 
             // Decoder
             MPSGraphTensor* dec_in = gb.linear(enc_out, e2d_w, e2d_b);
@@ -599,6 +617,10 @@ void MPSGraphEngine::load(const std::string& model_path) {
                                           mode:MPSGraphResizeBilinear centerResult:YES alignCorners:NO
                                         layout:MPSGraphTensorNamedDataLayoutNHWC name:nil];
             }
+            // Cast to FP32 for output (C++ reads FP32)
+            if (use_fp16) {
+                pts_conf = [graph_ castTensor:pts_conf toType:MPSDataTypeFloat32 name:nil];
+            }
             output_pts3d_conf_ = pts_conf;
 
             // Local features
@@ -608,7 +630,12 @@ void MPSGraphEngine::load(const std::string& model_path) {
             lf_result = [graph_ reshapeTensor:lf_result withShape:@[@1, @(PATCH_H), @(PATCH_W), @(lf_out)] name:nil];
             lf_result = gb.pixel_shuffle(lf_result, cfg.patch_size);
             NSArray<MPSGraphTensor*>* desc_split = [graph_ splitTensor:lf_result splitSizes:@[@(cfg.desc_dim), @1] axis:-1 name:nil];
-            output_descriptors_ = gb.l2_norm(desc_split[0]);
+            MPSGraphTensor* desc_out = gb.l2_norm(desc_split[0]);
+            // Cast to FP32 for output (C++ reads FP32)
+            if (use_fp16) {
+                desc_out = [graph_ castTensor:desc_out toType:MPSDataTypeFloat32 name:nil];
+            }
+            output_descriptors_ = desc_out;
 
             is_loaded_ = true;
         }
@@ -937,7 +964,8 @@ void MPSGraphEngine::load_retrieval(const std::string& model_path, const std::st
                 }
 
                 retrieval_graph_ = ctx_->create_graph();
-                GraphBuilder gb(retrieval_graph_, ctx_->device(), &files);
+                bool use_fp16 = (config_.precision == Precision::FP16);
+                GraphBuilder gb(retrieval_graph_, ctx_->device(), &files, use_fp16);
 
                 // Load ONLY encoder weights (no decoder)
                 std::string pe = cfg.patch_embed_key();
