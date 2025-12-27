@@ -58,9 +58,6 @@ public:
     // Warmup
     void warmup(int num_iterations = 3);
 
-    // Inference on image pair (copies to CPU - legacy)
-    InferenceResult infer(const ImageView& img1, const ImageView& img2);
-
     // Inference returning GPU handles (lazy copy - faster)
     // Data stays on GPU until .numpy() is called on each tensor.
     // This eliminates ~420ms of copy overhead when data isn't needed immediately.
@@ -118,6 +115,10 @@ private:
     bool is_retrieval_loaded_ = false;
     bool is_retrieval_standalone_ = false;  // true if retrieval loaded without main model
     bool pipeline_mode_enabled_ = false;    // true when using partitioned graphs
+
+    // Compilation descriptor for optimization level control
+    // Level0 = GPU-only (no ANE), Level1 = ANE+GPU+CPU placement (default)
+    MPSGraphCompilationDescriptor* compilation_desc_ = nil;
 
     // Shared context
     std::shared_ptr<MPSGraphContext> ctx_;
@@ -178,7 +179,24 @@ private:
     // Preprocessing
     void preprocess(const ImageView& img, float* output);
 
-    // Pre-allocated output buffers (shared memory for zero-copy)
+    // Pre-allocated INPUT buffers (avoid allocation per inference)
+    // Buffer size from MPSNDArray::resourceSize() to handle internal padding
+    // See: https://developer.apple.com/documentation/metalperformanceshaders/mpsndarray/resourcesize
+    size_t in_img_bytes_ = 0;  // Single image size for memcpy offset
+
+    // Batch [2, H, W, 3] for infer_gpu()
+    id<MTLBuffer> in_buf_batch_ = nil;
+    MPSNDArray* in_arr_batch_ = nil;
+    MPSGraphTensorData* in_td_batch_ = nil;
+    uint8_t* in_ptr_batch_ = nullptr;
+
+    // Single [1, H, W, 3] for encode_retrieval()
+    id<MTLBuffer> in_buf_single_ = nil;
+    MPSNDArray* in_arr_single_ = nil;
+    MPSGraphTensorData* in_td_single_ = nil;
+    uint8_t* in_ptr_single_ = nullptr;
+
+    // Pre-allocated OUTPUT buffers (shared memory for zero-copy)
     // Using two sets for async dual-image inference
     // MTLBuffers must be stored to prevent ARC release
     id<MTLBuffer> buf_pts3d_1_ = nil;

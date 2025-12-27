@@ -27,6 +27,14 @@ MPSGraphEngine::MPSGraphEngine(const RuntimeConfig& config, std::shared_ptr<MPSG
     if (@available(macOS 15.0, *)) {
         graph_ = ctx_->create_graph();
         spec_ = get_model_spec(config.variant);
+
+        // Initialize compilation descriptor with Level1 (ANE+GPU+CPU placement)
+        // Level0 = GPU-only (no ANE routing), Level1 = enables placement pass for ANE
+        compilation_desc_ = [[MPSGraphCompilationDescriptor alloc] init];
+        compilation_desc_.optimizationLevel = MPSGraphOptimizationLevel1;
+        compilation_desc_.waitForCompilationCompletion = YES;
+        NSLog(@"[MPSGraphEngine] Compilation: optimizationLevel=%llu (Level1=ANE+GPU)",
+              (unsigned long long)compilation_desc_.optimizationLevel);
     } else {
         throw std::runtime_error("MPSGraph SDPA requires macOS 15.0+");
     }
@@ -451,7 +459,38 @@ void MPSGraphEngine::load(const std::string& model_path) {
             output_descriptors_2_ = desc_2;
 
             // ================================================================
-            // Pre-allocate output buffers (reused across inferences)
+            // Pre-allocate INPUT buffers with correct size from resourceSize
+            // MPSNDArray has internal padding - query actual size needed
+            // See: https://developer.apple.com/documentation/metalperformanceshaders/mpsndarray/resourcesize
+            // ================================================================
+            in_img_bytes_ = IMG_H * IMG_W * 3;  // Single image size (uint8 RGB) for memcpy
+
+            // Batch input [2, H, W, 3] for infer_gpu()
+            MPSNDArrayDescriptor* batch_desc = [MPSNDArrayDescriptor descriptorWithDataType:MPSDataTypeUInt8
+                                                                                      shape:@[@2, @(IMG_H), @(IMG_W), @3]];
+            // Create temp array to query resourceSize
+            MPSNDArray* temp_batch = [[MPSNDArray alloc] initWithDevice:ctx_->device() descriptor:batch_desc];
+            NSUInteger batch_size = [temp_batch resourceSize];
+            // Allocate buffer with exact required size
+            in_buf_batch_ = [ctx_->device() newBufferWithLength:batch_size
+                                                        options:MTLResourceStorageModeShared];
+            in_arr_batch_ = [[MPSNDArray alloc] initWithBuffer:in_buf_batch_ offset:0 descriptor:batch_desc];
+            in_td_batch_ = [[MPSGraphTensorData alloc] initWithMPSNDArray:in_arr_batch_];
+            in_ptr_batch_ = static_cast<uint8_t*>(in_buf_batch_.contents);
+
+            // Single input [1, H, W, 3] for encode_retrieval()
+            MPSNDArrayDescriptor* single_desc = [MPSNDArrayDescriptor descriptorWithDataType:MPSDataTypeUInt8
+                                                                                       shape:@[@1, @(IMG_H), @(IMG_W), @3]];
+            MPSNDArray* temp_single = [[MPSNDArray alloc] initWithDevice:ctx_->device() descriptor:single_desc];
+            NSUInteger single_size = [temp_single resourceSize];
+            in_buf_single_ = [ctx_->device() newBufferWithLength:single_size
+                                                         options:MTLResourceStorageModeShared];
+            in_arr_single_ = [[MPSNDArray alloc] initWithBuffer:in_buf_single_ offset:0 descriptor:single_desc];
+            in_td_single_ = [[MPSGraphTensorData alloc] initWithMPSNDArray:in_arr_single_];
+            in_ptr_single_ = static_cast<uint8_t*>(in_buf_single_.contents);
+
+            // ================================================================
+            // Pre-allocate OUTPUT buffers (reused across inferences)
             // Using storageModeShared for zero-copy CPU access
             // ================================================================
             const size_t pts3d_elements = IMG_H * IMG_W * 3;
@@ -541,12 +580,19 @@ void MPSGraphEngine::warmup(int num_iterations) {
                 output_descriptors_2_: out_desc_2_
             };
 
+            // Create execution descriptor with compilation settings
+            MPSGraphExecutionDescriptor* execDesc = [[MPSGraphExecutionDescriptor alloc] init];
+            execDesc.compilationDescriptor = compilation_desc_;
+            execDesc.waitUntilCompleted = YES;
+
             // Warmup graph (compiles and caches Metal shaders)
+            // Uses async variant with waitUntilCompleted=YES to pass compilation descriptor
             for (int i = 0; i < num_iterations; i++) {
-                [graph_ runWithMTLCommandQueue:ctx_->queue()
-                                         feeds:feeds
-                              targetOperations:nil
-                             resultsDictionary:resultsDict];
+                [graph_ runAsyncWithMTLCommandQueue:ctx_->queue()
+                                              feeds:feeds
+                                   targetOperations:nil
+                                  resultsDictionary:resultsDict
+                                executionDescriptor:execDesc];
             }
         }
     }
@@ -571,121 +617,6 @@ void MPSGraphEngine::preprocess(const ImageView& img, float* output) {
     }
 }
 
-InferenceResult MPSGraphEngine::infer(const ImageView& img1, const ImageView& img2) {
-    InferenceResult result;
-
-    if (!is_loaded_) {
-        throw std::runtime_error("Model not loaded");
-    }
-
-    if (@available(macOS 15.0, *)) {
-        @autoreleasepool {
-            auto total_start = std::chrono::high_resolution_clock::now();
-
-            const int IMG_H = config_.resolution;
-            const int IMG_W = static_cast<int>(config_.resolution * 4.0f / 3.0f);
-
-            // GPU preprocessing: pass uint8 directly, no CPU normalization needed
-            auto preprocess_start = std::chrono::high_resolution_clock::now();
-            auto preprocess_end = preprocess_start;  // No CPU preprocessing
-
-            // Create tensor data (uint8 for GPU preprocessing)
-            MPSNDArrayDescriptor* desc = [MPSNDArrayDescriptor descriptorWithDataType:MPSDataTypeUInt8
-                                                                                shape:@[@1, @(IMG_H), @(IMG_W), @3]];
-
-            // Prepare both images
-            MPSNDArray* arr1 = [[MPSNDArray alloc] initWithDevice:ctx_->device() descriptor:desc];
-            MPSNDArray* arr2 = [[MPSNDArray alloc] initWithDevice:ctx_->device() descriptor:desc];
-            [arr1 writeBytes:(void*)img1.data strideBytes:nil];
-            [arr2 writeBytes:(void*)img2.data strideBytes:nil];
-            MPSGraphTensorData* td1 = [[MPSGraphTensorData alloc] initWithMPSNDArray:arr1];
-            MPSGraphTensorData* td2 = [[MPSGraphTensorData alloc] initWithMPSNDArray:arr2];
-
-            // Run inference on both images with async execution + semaphore
-            auto inference_start = std::chrono::high_resolution_clock::now();
-
-            dispatch_semaphore_t sem1 = dispatch_semaphore_create(0);
-            dispatch_semaphore_t sem2 = dispatch_semaphore_create(0);
-
-            // Launch both async using graph with PRE-ALLOCATED output buffers
-            NSDictionary* feeds1 = @{input_placeholder_: td1};
-            NSDictionary* feeds2 = @{input_placeholder_: td2};
-
-            // Pre-allocated resultsDictionary - GPU writes directly into shared buffers
-            NSDictionary* resultsDict1 = @{
-                output_pts3d_: out_pts3d_1_,
-                output_conf_: out_conf_1_,
-                output_descriptors_: out_desc_1_
-            };
-            NSDictionary* resultsDict2 = @{
-                output_pts3d_: out_pts3d_2_,
-                output_conf_: out_conf_2_,
-                output_descriptors_: out_desc_2_
-            };
-
-            MPSGraphExecutionDescriptor* execDesc1 = [[MPSGraphExecutionDescriptor alloc] init];
-            execDesc1.completionHandler = ^(NSDictionary<MPSGraphTensor*, MPSGraphTensorData*>* res, NSError* err) {
-                dispatch_semaphore_signal(sem1);
-            };
-            MPSGraphExecutionDescriptor* execDesc2 = [[MPSGraphExecutionDescriptor alloc] init];
-            execDesc2.completionHandler = ^(NSDictionary<MPSGraphTensor*, MPSGraphTensorData*>* res, NSError* err) {
-                dispatch_semaphore_signal(sem2);
-            };
-
-            // Use resultsDictionary variant - no allocation per inference!
-            [graph_ runAsyncWithMTLCommandQueue:ctx_->queue()
-                                          feeds:feeds1
-                               targetOperations:nil
-                              resultsDictionary:resultsDict1
-                            executionDescriptor:execDesc1];
-
-            [graph_ runAsyncWithMTLCommandQueue:ctx_->queue()
-                                          feeds:feeds2
-                               targetOperations:nil
-                              resultsDictionary:resultsDict2
-                            executionDescriptor:execDesc2];
-
-            // Wait for both to complete
-            dispatch_semaphore_wait(sem1, DISPATCH_TIME_FOREVER);
-            dispatch_semaphore_wait(sem2, DISPATCH_TIME_FOREVER);
-
-            auto inference_end = std::chrono::high_resolution_clock::now();
-
-            // Results are already in shared buffers - copy to output
-            result.height = IMG_H;
-            result.width = IMG_W;
-            result.desc_dim = spec_.desc_dim;
-
-            size_t pts3d_size = IMG_H * IMG_W * 3;
-            size_t conf_size = IMG_H * IMG_W;
-            size_t desc_size = IMG_H * IMG_W * spec_.desc_dim;
-
-            result.pts3d_1 = new float[pts3d_size];
-            result.pts3d_2 = new float[pts3d_size];
-            result.conf_1 = new float[conf_size];
-            result.conf_2 = new float[conf_size];
-            result.desc_1 = new float[desc_size];
-            result.desc_2 = new float[desc_size];
-
-            // Zero-copy read from shared MTLBuffer (storageModeShared)
-            std::memcpy(result.pts3d_1, ptr_pts3d_1_, pts3d_size * sizeof(float));
-            std::memcpy(result.pts3d_2, ptr_pts3d_2_, pts3d_size * sizeof(float));
-            std::memcpy(result.conf_1, ptr_conf_1_, conf_size * sizeof(float));
-            std::memcpy(result.conf_2, ptr_conf_2_, conf_size * sizeof(float));
-            std::memcpy(result.desc_1, ptr_desc_1_, desc_size * sizeof(float));
-            std::memcpy(result.desc_2, ptr_desc_2_, desc_size * sizeof(float));
-
-            auto total_end = std::chrono::high_resolution_clock::now();
-
-            result.preprocess_ms = std::chrono::duration<double, std::milli>(preprocess_end - preprocess_start).count();
-            result.inference_ms = std::chrono::duration<double, std::milli>(inference_end - inference_start).count();
-            result.total_ms = std::chrono::duration<double, std::milli>(total_end - total_start).count();
-        }
-    }
-
-    return result;
-}
-
 GPUInferenceResult MPSGraphEngine::infer_gpu(const ImageView& img1, const ImageView& img2) {
     GPUInferenceResult result;
 
@@ -708,24 +639,16 @@ GPUInferenceResult MPSGraphEngine::infer_gpu(const ImageView& img1, const ImageV
 
             auto preprocess_start = std::chrono::high_resolution_clock::now();
 
-            // Create batched input tensor [2, H, W, 3]
-            MPSNDArrayDescriptor* desc = [MPSNDArrayDescriptor descriptorWithDataType:MPSDataTypeUInt8
-                                                                                shape:@[@2, @(IMG_H), @(IMG_W), @3]];
-            MPSNDArray* arr = [[MPSNDArray alloc] initWithDevice:ctx_->device() descriptor:desc];
+            // Copy both images directly to PRE-ALLOCATED shared buffer (zero-copy to GPU)
+            std::memcpy(in_ptr_batch_, img1.data, in_img_bytes_);
+            std::memcpy(in_ptr_batch_ + in_img_bytes_, img2.data, in_img_bytes_);
 
-            // Copy both images into batched tensor
-            std::vector<uint8_t> batched_data(2 * img_bytes);
-            std::memcpy(batched_data.data(), img1.data, img_bytes);
-            std::memcpy(batched_data.data() + img_bytes, img2.data, img_bytes);
-            [arr writeBytes:(void*)batched_data.data() strideBytes:nil];
-
-            MPSGraphTensorData* td = [[MPSGraphTensorData alloc] initWithMPSNDArray:arr];
             auto preprocess_end = std::chrono::high_resolution_clock::now();
 
-            // Single graph run with batch=2
+            // Single graph run with batch=2 using pre-allocated input
             auto inference_start = std::chrono::high_resolution_clock::now();
 
-            NSDictionary* feeds = @{input_placeholder_: td};
+            NSDictionary* feeds = @{input_placeholder_: in_td_batch_};
 
             // Pre-allocated resultsDictionary for all 6 outputs (2 images × 3 outputs)
             NSDictionary* resultsDict = @{
@@ -737,11 +660,17 @@ GPUInferenceResult MPSGraphEngine::infer_gpu(const ImageView& img1, const ImageV
                 output_descriptors_2_: out_desc_2_
             };
 
-            // Single synchronous run - no need for semaphores
-            [graph_ runWithMTLCommandQueue:ctx_->queue()
-                                     feeds:feeds
-                          targetOperations:nil
-                         resultsDictionary:resultsDict];
+            // Create execution descriptor with compilation settings (Level1 = ANE+GPU)
+            MPSGraphExecutionDescriptor* execDesc = [[MPSGraphExecutionDescriptor alloc] init];
+            execDesc.compilationDescriptor = compilation_desc_;
+            execDesc.waitUntilCompleted = YES;
+
+            // Synchronous run with compilation descriptor via async+waitUntilCompleted
+            [graph_ runAsyncWithMTLCommandQueue:ctx_->queue()
+                                          feeds:feeds
+                               targetOperations:nil
+                              resultsDictionary:resultsDict
+                            executionDescriptor:execDesc];
 
             auto inference_end = std::chrono::high_resolution_clock::now();
 
@@ -1088,22 +1017,27 @@ RetrievalResult MPSGraphEngine::encode_retrieval(const ImageView& img) {
             const int PATCH_W = IMG_W / cfg.patch_size;
             const int NUM_PATCHES = PATCH_H * PATCH_W;
 
-            // Create tensor data (uint8 for GPU preprocessing)
-            MPSNDArrayDescriptor* img_desc = [MPSNDArrayDescriptor descriptorWithDataType:MPSDataTypeUInt8
-                                                                                    shape:@[@1, @(IMG_H), @(IMG_W), @3]];
-            MPSNDArray* img_arr = [[MPSNDArray alloc] initWithDevice:ctx_->device() descriptor:img_desc];
-            [img_arr writeBytes:(void*)img.data strideBytes:nil];
-            MPSGraphTensorData* img_td = [[MPSGraphTensorData alloc] initWithMPSNDArray:img_arr];
-
             if (is_retrieval_standalone_) {
+                // Standalone mode: allocate input (different graph/placeholder)
+                MPSNDArrayDescriptor* img_desc = [MPSNDArrayDescriptor descriptorWithDataType:MPSDataTypeUInt8
+                                                                                        shape:@[@1, @(IMG_H), @(IMG_W), @3]];
+                MPSNDArray* img_arr = [[MPSNDArray alloc] initWithDevice:ctx_->device() descriptor:img_desc];
+                [img_arr writeBytes:(void*)img.data strideBytes:nil];
+                MPSGraphTensorData* img_td = [[MPSGraphTensorData alloc] initWithMPSNDArray:img_arr];
                 // ================================================================
                 // STANDALONE MODE: single graph (encoder + whitening)
                 // ================================================================
                 auto encoder_start = std::chrono::high_resolution_clock::now();
-                NSDictionary* results = [retrieval_graph_ runWithMTLCommandQueue:ctx_->queue()
-                                                                           feeds:@{retrieval_input_: img_td}
-                                                                   targetTensors:@[retrieval_features_, retrieval_attention_]
-                                                                targetOperations:nil];
+
+                MPSGraphExecutionDescriptor* execDesc = [[MPSGraphExecutionDescriptor alloc] init];
+                execDesc.compilationDescriptor = compilation_desc_;  // Level1 = ANE+GPU
+                execDesc.waitUntilCompleted = YES;
+
+                NSDictionary* results = [retrieval_graph_ runAsyncWithMTLCommandQueue:ctx_->queue()
+                                                                                feeds:@{retrieval_input_: img_td}
+                                                                       targetTensors:@[retrieval_features_, retrieval_attention_]
+                                                                    targetOperations:nil
+                                                                 executionDescriptor:execDesc];
                 auto encoder_end = std::chrono::high_resolution_clock::now();
 
                 // Copy results
@@ -1128,23 +1062,34 @@ RetrievalResult MPSGraphEngine::encode_retrieval(const ImageView& img) {
                 // ================================================================
                 // WEIGHT SHARING MODE: single-image encoder in main graph + whitening
                 // Uses TRUE weight sharing - encoder weights are shared with batch=2 path
+                // Uses PRE-ALLOCATED shared buffer (zero-copy to GPU)
                 // ================================================================
+
+                // Copy image data directly to pre-allocated shared buffer
+                std::memcpy(in_ptr_single_, img.data, in_img_bytes_);
+
+                // Execution descriptor with compilation options
+                MPSGraphExecutionDescriptor* execDesc = [[MPSGraphExecutionDescriptor alloc] init];
+                execDesc.compilationDescriptor = compilation_desc_;  // Level1 = ANE+GPU
+                execDesc.waitUntilCompleted = YES;
 
                 // Step 1: Run encoder via main graph's single-image path
                 auto encoder_start = std::chrono::high_resolution_clock::now();
-                NSDictionary* enc_results = [graph_ runWithMTLCommandQueue:ctx_->queue()
-                                                                     feeds:@{single_img_input_: img_td}
-                                                             targetTensors:@[single_img_enc_output_]
-                                                          targetOperations:nil];
+                NSDictionary* enc_results = [graph_ runAsyncWithMTLCommandQueue:ctx_->queue()
+                                                                          feeds:@{single_img_input_: in_td_single_}
+                                                                  targetTensors:@[single_img_enc_output_]
+                                                               targetOperations:nil
+                                                            executionDescriptor:execDesc];
                 auto encoder_end = std::chrono::high_resolution_clock::now();
 
                 // Step 2: Run whitening graph on encoder output
                 auto whiten_start = std::chrono::high_resolution_clock::now();
                 MPSGraphTensorData* enc_td = enc_results[single_img_enc_output_];
-                NSDictionary* whiten_results = [whitening_graph_ runWithMTLCommandQueue:ctx_->queue()
-                                                                                  feeds:@{whitening_input_: enc_td}
-                                                                          targetTensors:@[whitening_output_, whitening_attention_]
-                                                                       targetOperations:nil];
+                NSDictionary* whiten_results = [whitening_graph_ runAsyncWithMTLCommandQueue:ctx_->queue()
+                                                                                       feeds:@{whitening_input_: enc_td}
+                                                                               targetTensors:@[whitening_output_, whitening_attention_]
+                                                                            targetOperations:nil
+                                                                         executionDescriptor:execDesc];
                 auto whiten_end = std::chrono::high_resolution_clock::now();
 
                 // Copy results
@@ -1218,6 +1163,7 @@ std::vector<RetrievalResult> MPSGraphEngine::encode_retrieval_batch(const std::v
                     semaphores[i] = dispatch_semaphore_create(0);
 
                     MPSGraphExecutionDescriptor* execDesc = [[MPSGraphExecutionDescriptor alloc] init];
+                    execDesc.compilationDescriptor = compilation_desc_;  // Level1 = ANE+GPU
                     dispatch_semaphore_t sem = semaphores[i];
                     size_t idx = i;
 
@@ -1266,6 +1212,7 @@ std::vector<RetrievalResult> MPSGraphEngine::encode_retrieval_batch(const std::v
                     enc_sems[i] = dispatch_semaphore_create(0);
 
                     MPSGraphExecutionDescriptor* execDesc = [[MPSGraphExecutionDescriptor alloc] init];
+                    execDesc.compilationDescriptor = compilation_desc_;  // Level1 = ANE+GPU
                     dispatch_semaphore_t sem = enc_sems[i];
                     size_t idx = i;
 
@@ -1288,6 +1235,7 @@ std::vector<RetrievalResult> MPSGraphEngine::encode_retrieval_batch(const std::v
                     whiten_sems[i] = dispatch_semaphore_create(0);
 
                     MPSGraphExecutionDescriptor* execDesc = [[MPSGraphExecutionDescriptor alloc] init];
+                    execDesc.compilationDescriptor = compilation_desc_;  // Level1 = ANE+GPU
                     dispatch_semaphore_t sem = whiten_sems[i];
                     size_t idx = i;
 
@@ -1472,6 +1420,7 @@ std::vector<GPUInferenceResult> MPSGraphEngine::infer_batch_pipelined(const std:
                 };
 
                 MPSGraphExecutionDescriptor* execDesc = [[MPSGraphExecutionDescriptor alloc] init];
+                execDesc.compilationDescriptor = compilation_desc_;  // Level1 = ANE+GPU
                 dispatch_semaphore_t sem = semaphores[i];
                 execDesc.completionHandler = ^(NSDictionary<MPSGraphTensor*, MPSGraphTensorData*>* res, NSError* err) {
                     dispatch_semaphore_signal(sem);

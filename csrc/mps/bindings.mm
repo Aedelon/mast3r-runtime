@@ -29,17 +29,6 @@ ImageView numpy_to_image_view(py::array_t<uint8_t> arr) {
     return view;
 }
 
-// Python wrapper for InferenceResult
-struct PyInferenceResult {
-    py::array_t<float> pts3d_1;
-    py::array_t<float> pts3d_2;
-    py::array_t<float> desc_1;
-    py::array_t<float> desc_2;
-    py::array_t<float> conf_1;
-    py::array_t<float> conf_2;
-    py::dict timing;
-};
-
 // Python wrapper for MatchResult
 struct PyMatchResult {
     py::array_t<int64_t> idx_1;
@@ -154,50 +143,6 @@ public:
 
     void warmup(int num_iterations) {
         engine_->warmup(num_iterations);
-    }
-
-    PyInferenceResult infer(
-        py::array_t<uint8_t> img1,
-        py::array_t<uint8_t> img2
-    ) {
-        auto view1 = numpy_to_image_view(img1);
-        auto view2 = numpy_to_image_view(img2);
-
-        auto result = engine_->infer(view1, view2);
-
-        PyInferenceResult py_result;
-
-        const int H = result.height;
-        const int W = result.width;
-        const int D = result.desc_dim;
-
-        py_result.pts3d_1 = py::array_t<float>({H, W, 3});
-        py_result.pts3d_2 = py::array_t<float>({H, W, 3});
-        py_result.desc_1 = py::array_t<float>({H, W, D});
-        py_result.desc_2 = py::array_t<float>({H, W, D});
-        py_result.conf_1 = py::array_t<float>({H, W});
-        py_result.conf_2 = py::array_t<float>({H, W});
-
-        std::memcpy(py_result.pts3d_1.mutable_data(), result.pts3d_1, H * W * 3 * sizeof(float));
-        std::memcpy(py_result.pts3d_2.mutable_data(), result.pts3d_2, H * W * 3 * sizeof(float));
-        std::memcpy(py_result.desc_1.mutable_data(), result.desc_1, H * W * D * sizeof(float));
-        std::memcpy(py_result.desc_2.mutable_data(), result.desc_2, H * W * D * sizeof(float));
-        std::memcpy(py_result.conf_1.mutable_data(), result.conf_1, H * W * sizeof(float));
-        std::memcpy(py_result.conf_2.mutable_data(), result.conf_2, H * W * sizeof(float));
-
-        // Clean up C++ allocations
-        delete[] result.pts3d_1;
-        delete[] result.pts3d_2;
-        delete[] result.desc_1;
-        delete[] result.desc_2;
-        delete[] result.conf_1;
-        delete[] result.conf_2;
-
-        py_result.timing["preprocess_ms"] = result.preprocess_ms;
-        py_result.timing["inference_ms"] = result.inference_ms;
-        py_result.timing["total_ms"] = result.total_ms;
-
-        return py_result;
     }
 
     // GPU tensor version - data stays on GPU until .numpy() is called
@@ -406,15 +351,6 @@ private:
 PYBIND11_MODULE(_mps, m) {
     m.doc() = "MASt3R Runtime MPS Backend (Apple Silicon with MPSGraph SDPA)";
 
-    py::class_<PyInferenceResult>(m, "InferenceResult")
-        .def_readonly("pts3d_1", &PyInferenceResult::pts3d_1)
-        .def_readonly("pts3d_2", &PyInferenceResult::pts3d_2)
-        .def_readonly("desc_1", &PyInferenceResult::desc_1)
-        .def_readonly("desc_2", &PyInferenceResult::desc_2)
-        .def_readonly("conf_1", &PyInferenceResult::conf_1)
-        .def_readonly("conf_2", &PyInferenceResult::conf_2)
-        .def_readonly("timing", &PyInferenceResult::timing);
-
     py::class_<PyMatchResult>(m, "MatchResult")
         .def_readonly("idx_1", &PyMatchResult::idx_1)
         .def_readonly("idx_2", &PyMatchResult::idx_2)
@@ -461,9 +397,6 @@ PYBIND11_MODULE(_mps, m) {
         .def("is_ready", &PyMPSEngine::is_ready)
         .def("name", &PyMPSEngine::name)
         .def("warmup", &PyMPSEngine::warmup, py::arg("num_iterations") = 3)
-        .def("infer", &PyMPSEngine::infer,
-             "Run inference and copy results to CPU (legacy). "
-             "Use infer_gpu() for lazy-copy pattern.")
         .def("infer_gpu", &PyMPSEngine::infer_gpu,
              "Run inference returning GPU tensor handles (fast). "
              "Data stays on GPU until .numpy() is called on each tensor. "
