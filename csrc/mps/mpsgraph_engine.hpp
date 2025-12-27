@@ -63,6 +63,23 @@ public:
         const MatchingConfig& config
     );
 
+    // Load retrieval weights (prewhiten.m, prewhiten.p)
+    // If main model is loaded: uses weight sharing (encoder from main graph)
+    // If main model is NOT loaded: builds standalone encoder + whitening graph
+    void load_retrieval(const std::string& model_path, const std::string& retrieval_path);
+
+    // Convenience overload: retrieval_path in same directory as model
+    void load_retrieval(const std::string& retrieval_path);
+
+    // Encoder-only mode for retrieval (returns whitened features + attention)
+    RetrievalResult encode_retrieval(const ImageView& img);
+
+    // Check if retrieval is ready
+    bool is_retrieval_ready() const { return is_retrieval_loaded_; }
+
+    // Check if using standalone retrieval (no main model)
+    bool is_retrieval_standalone() const { return is_retrieval_standalone_; }
+
     // Access context
     std::shared_ptr<MPSGraphContext> context() const { return ctx_; }
 
@@ -73,6 +90,8 @@ private:
     RuntimeConfig config_;
     ModelSpec spec_;
     bool is_loaded_ = false;
+    bool is_retrieval_loaded_ = false;
+    bool is_retrieval_standalone_ = false;  // true if retrieval loaded without main model
 
     // Shared context
     std::shared_ptr<MPSGraphContext> ctx_;
@@ -80,12 +99,25 @@ private:
     // Graph (not shared - each engine has its own compiled graph)
     MPSGraph* graph_ = nil;
 
-    // Placeholders
-    MPSGraphTensor* input_placeholder_ = nil;
+    // Placeholders (uint8 input for GPU preprocessing)
+    MPSGraphTensor* input_placeholder_ = nil;  // [1, H, W, 3] uint8
 
     // Output tensors
     MPSGraphTensor* output_pts3d_conf_ = nil;
     MPSGraphTensor* output_descriptors_ = nil;
+    MPSGraphTensor* output_enc_features_ = nil;  // Encoder output [N, D] for retrieval
+
+    // Whitening graph (small, reuses encoder from main graph when available)
+    MPSGraph* whitening_graph_ = nil;
+    MPSGraphTensor* whitening_input_ = nil;     // [N, D] encoder features
+    MPSGraphTensor* whitening_output_ = nil;    // [N, D] whitened features
+    MPSGraphTensor* whitening_attention_ = nil; // [N] L2 attention scores
+
+    // Standalone retrieval graph (encoder + whitening, used when main model not loaded)
+    MPSGraph* retrieval_graph_ = nil;
+    MPSGraphTensor* retrieval_input_ = nil;     // [1, H, W, 3] uint8
+    MPSGraphTensor* retrieval_features_ = nil;  // [N, D] whitened features
+    MPSGraphTensor* retrieval_attention_ = nil; // [N] L2 attention scores
 
     // Build the complete graph
     void build_graph();

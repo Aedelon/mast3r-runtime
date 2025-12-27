@@ -269,6 +269,33 @@ public:
         MPSGraphTensor* norm = [graph_ squareRootWithTensor:[graph_ additionWithPrimaryTensor:sum secondaryTensor:eps name:nil] name:nil];
         return [graph_ divisionWithPrimaryTensor:x secondaryTensor:norm name:nil];
     }
+
+    // GPU-based ImageNet normalization: (x / 255 - mean) / std
+    // Input: uint8 [B, H, W, 3], Output: float32 [B, H, W, 3]
+    MPSGraphTensor* imagenet_normalize(MPSGraphTensor* x) {
+        // Cast to float32
+        MPSGraphTensor* xf = [graph_ castTensor:x toType:MPSDataTypeFloat32 name:nil];
+
+        // Divide by 255
+        MPSGraphTensor* inv255 = [graph_ constantWithScalar:1.0f/255.0f shape:@[@1] dataType:MPSDataTypeFloat32];
+        xf = [graph_ multiplicationWithPrimaryTensor:xf secondaryTensor:inv255 name:nil];
+
+        // ImageNet mean and inv_std per channel: [1, 1, 1, 3]
+        float mean_vals[3] = {0.485f, 0.456f, 0.406f};
+        float inv_std_vals[3] = {1.0f/0.229f, 1.0f/0.224f, 1.0f/0.225f};
+
+        NSData* mean_data = [NSData dataWithBytes:mean_vals length:3 * sizeof(float)];
+        NSData* inv_std_data = [NSData dataWithBytes:inv_std_vals length:3 * sizeof(float)];
+
+        MPSGraphTensor* mean = [graph_ constantWithData:mean_data shape:@[@1, @1, @1, @3] dataType:MPSDataTypeFloat32];
+        MPSGraphTensor* inv_std = [graph_ constantWithData:inv_std_data shape:@[@1, @1, @1, @3] dataType:MPSDataTypeFloat32];
+
+        // (x - mean) * inv_std
+        xf = [graph_ subtractionWithPrimaryTensor:xf secondaryTensor:mean name:nil];
+        xf = [graph_ multiplicationWithPrimaryTensor:xf secondaryTensor:inv_std name:nil];
+
+        return xf;
+    }
 };
 
 // ============================================================================
@@ -462,14 +489,18 @@ void MPSGraphEngine::load(const std::string& model_path) {
             auto hd4b = gb.load(dp+"head.4.bias", @[@4]);
 
             // ================================================================
-            // Build graph
+            // Build graph with GPU preprocessing
             // ================================================================
 
+            // Accept uint8 input directly - preprocessing on GPU
             input_placeholder_ = [graph_ placeholderWithShape:@[@1, @(IMG_H), @(IMG_W), @3]
-                                                     dataType:MPSDataTypeFloat32 name:@"image"];
+                                                     dataType:MPSDataTypeUInt8 name:@"image_uint8"];
+
+            // GPU preprocessing: uint8 → float32 with ImageNet normalization
+            MPSGraphTensor* normalized = gb.imagenet_normalize(input_placeholder_);
 
             // Patch embedding
-            MPSGraphTensor* patches = gb.conv2d(input_placeholder_, patch_w, patch_b, cfg.patch_size, 0);
+            MPSGraphTensor* patches = gb.conv2d(normalized, patch_w, patch_b, cfg.patch_size, 0);
             patches = [graph_ reshapeTensor:patches withShape:@[@(NUM_PATCHES), @(cfg.enc_dim)] name:nil];
 
             // Encoder
@@ -489,6 +520,9 @@ void MPSGraphEngine::load(const std::string& model_path) {
             }
             x = gb.layer_norm(x, enc_nw, enc_nb);
             MPSGraphTensor* enc_out = x;
+
+            // Expose encoder output for retrieval (weight sharing)
+            output_enc_features_ = enc_out;  // [N, D] where D=enc_dim
 
             // Decoder
             MPSGraphTensor* dec_in = gb.linear(enc_out, e2d_w, e2d_b);
@@ -588,15 +622,25 @@ void MPSGraphEngine::warmup(int num_iterations) {
         @autoreleasepool {
             const int IMG_H = config_.resolution;
             const int IMG_W = static_cast<int>(config_.resolution * 4.0f / 3.0f);
+            const size_t img_bytes = IMG_H * IMG_W * 3;
 
-            std::vector<float> dummy(IMG_H * IMG_W * 3, 0.0f);
-            MPSNDArrayDescriptor* desc = [MPSNDArrayDescriptor descriptorWithDataType:MPSDataTypeFloat32
+            // Warmup buffer pool with expected sizes
+            ctx_->buffer_pool().warmup({
+                img_bytes,                              // Input uint8 image
+                IMG_H * IMG_W * 4 * sizeof(float),      // pts3d_conf output
+                IMG_H * IMG_W * spec_.desc_dim * sizeof(float)  // Descriptors output
+            });
+
+            // Use uint8 input (GPU preprocessing)
+            std::vector<uint8_t> dummy(img_bytes, 128);
+            MPSNDArrayDescriptor* desc = [MPSNDArrayDescriptor descriptorWithDataType:MPSDataTypeUInt8
                                                                                 shape:@[@1, @(IMG_H), @(IMG_W), @3]];
             MPSNDArray* arr = [[MPSNDArray alloc] initWithDevice:ctx_->device() descriptor:desc];
             [arr writeBytes:(void*)dummy.data() strideBytes:nil];
             MPSGraphTensorData* td = [[MPSGraphTensorData alloc] initWithMPSNDArray:arr];
             NSDictionary* feeds = @{input_placeholder_: td};
 
+            // Warmup graph execution (compiles and caches Metal shaders)
             for (int i = 0; i < num_iterations; i++) {
                 [graph_ runWithMTLCommandQueue:ctx_->queue() feeds:feeds
                                   targetTensors:@[output_pts3d_conf_, output_descriptors_] targetOperations:nil];
@@ -607,16 +651,19 @@ void MPSGraphEngine::warmup(int num_iterations) {
 
 void MPSGraphEngine::preprocess(const ImageView& img, float* output) {
     // ImageNet normalization: (x / 255 - mean) / std
+    // Optimized with Accelerate framework
+    const size_t n = static_cast<size_t>(img.height) * img.width;
+    const float inv255 = 1.0f / 255.0f;
     const float mean[3] = {0.485f, 0.456f, 0.406f};
-    const float std[3] = {0.229f, 0.224f, 0.225f};
+    const float inv_std[3] = {1.0f / 0.229f, 1.0f / 0.224f, 1.0f / 0.225f};
 
-    for (int y = 0; y < img.height; y++) {
-        for (int x = 0; x < img.width; x++) {
-            int idx = (y * img.width + x) * 3;
-            for (int c = 0; c < 3; c++) {
-                float val = static_cast<float>(img.data[idx + c]) / 255.0f;
-                output[idx + c] = (val - mean[c]) / std[c];
-            }
+    // Process each channel with vectorized operations
+    for (int c = 0; c < 3; c++) {
+        const float m = mean[c];
+        const float s = inv_std[c];
+        for (size_t i = 0; i < n; i++) {
+            float val = static_cast<float>(img.data[i * 3 + c]) * inv255;
+            output[i * 3 + c] = (val - m) * s;
         }
     }
 }
@@ -634,36 +681,61 @@ InferenceResult MPSGraphEngine::infer(const ImageView& img1, const ImageView& im
 
             const int IMG_H = config_.resolution;
             const int IMG_W = static_cast<int>(config_.resolution * 4.0f / 3.0f);
-            const size_t img_size = IMG_H * IMG_W * 3;
 
-            // Preprocess
+            // GPU preprocessing: pass uint8 directly, no CPU normalization needed
             auto preprocess_start = std::chrono::high_resolution_clock::now();
-            std::vector<float> img1_normalized(img_size);
-            std::vector<float> img2_normalized(img_size);
-            preprocess(img1, img1_normalized.data());
-            preprocess(img2, img2_normalized.data());
-            auto preprocess_end = std::chrono::high_resolution_clock::now();
+            auto preprocess_end = preprocess_start;  // No CPU preprocessing
 
-            // Create tensor data
-            MPSNDArrayDescriptor* desc = [MPSNDArrayDescriptor descriptorWithDataType:MPSDataTypeFloat32
+            // Create tensor data (uint8 for GPU preprocessing)
+            MPSNDArrayDescriptor* desc = [MPSNDArrayDescriptor descriptorWithDataType:MPSDataTypeUInt8
                                                                                 shape:@[@1, @(IMG_H), @(IMG_W), @3]];
 
-            // Run inference on both images
+            // Prepare both images
+            MPSNDArray* arr1 = [[MPSNDArray alloc] initWithDevice:ctx_->device() descriptor:desc];
+            MPSNDArray* arr2 = [[MPSNDArray alloc] initWithDevice:ctx_->device() descriptor:desc];
+            [arr1 writeBytes:(void*)img1.data strideBytes:nil];
+            [arr2 writeBytes:(void*)img2.data strideBytes:nil];
+            MPSGraphTensorData* td1 = [[MPSGraphTensorData alloc] initWithMPSNDArray:arr1];
+            MPSGraphTensorData* td2 = [[MPSGraphTensorData alloc] initWithMPSNDArray:arr2];
+
+            // Run inference on both images with async execution + semaphore
             auto inference_start = std::chrono::high_resolution_clock::now();
 
-            // Image 1
-            MPSNDArray* arr1 = [[MPSNDArray alloc] initWithDevice:ctx_->device() descriptor:desc];
-            [arr1 writeBytes:(void*)img1_normalized.data() strideBytes:nil];
-            MPSGraphTensorData* td1 = [[MPSGraphTensorData alloc] initWithMPSNDArray:arr1];
-            NSDictionary* results1 = [graph_ runWithMTLCommandQueue:ctx_->queue() feeds:@{input_placeholder_: td1}
-                                                       targetTensors:@[output_pts3d_conf_, output_descriptors_] targetOperations:nil];
+            __block NSDictionary* results1 = nil;
+            __block NSDictionary* results2 = nil;
+            dispatch_semaphore_t sem1 = dispatch_semaphore_create(0);
+            dispatch_semaphore_t sem2 = dispatch_semaphore_create(0);
 
-            // Image 2
-            MPSNDArray* arr2 = [[MPSNDArray alloc] initWithDevice:ctx_->device() descriptor:desc];
-            [arr2 writeBytes:(void*)img2_normalized.data() strideBytes:nil];
-            MPSGraphTensorData* td2 = [[MPSGraphTensorData alloc] initWithMPSNDArray:arr2];
-            NSDictionary* results2 = [graph_ runWithMTLCommandQueue:ctx_->queue() feeds:@{input_placeholder_: td2}
-                                                       targetTensors:@[output_pts3d_conf_, output_descriptors_] targetOperations:nil];
+            // Async execution descriptor for image 1
+            MPSGraphExecutionDescriptor* execDesc1 = [[MPSGraphExecutionDescriptor alloc] init];
+            execDesc1.completionHandler = ^(NSDictionary<MPSGraphTensor*, MPSGraphTensorData*>* res, NSError* err) {
+                results1 = res;
+                dispatch_semaphore_signal(sem1);
+            };
+
+            // Async execution descriptor for image 2
+            MPSGraphExecutionDescriptor* execDesc2 = [[MPSGraphExecutionDescriptor alloc] init];
+            execDesc2.completionHandler = ^(NSDictionary<MPSGraphTensor*, MPSGraphTensorData*>* res, NSError* err) {
+                results2 = res;
+                dispatch_semaphore_signal(sem2);
+            };
+
+            // Launch both async - GPU can overlap work
+            [graph_ runAsyncWithMTLCommandQueue:ctx_->queue()
+                                          feeds:@{input_placeholder_: td1}
+                                  targetTensors:@[output_pts3d_conf_, output_descriptors_]
+                               targetOperations:nil
+                            executionDescriptor:execDesc1];
+
+            [graph_ runAsyncWithMTLCommandQueue:ctx_->queue()
+                                          feeds:@{input_placeholder_: td2}
+                                  targetTensors:@[output_pts3d_conf_, output_descriptors_]
+                               targetOperations:nil
+                            executionDescriptor:execDesc2];
+
+            // Wait for both to complete
+            dispatch_semaphore_wait(sem1, DISPATCH_TIME_FOREVER);
+            dispatch_semaphore_wait(sem2, DISPATCH_TIME_FOREVER);
 
             auto inference_end = std::chrono::high_resolution_clock::now();
 
@@ -768,6 +840,292 @@ MatchResult MPSGraphEngine::match(
 
     auto end = std::chrono::high_resolution_clock::now();
     result.match_ms = std::chrono::duration<double, std::milli>(end - start).count();
+
+    return result;
+}
+
+// Convenience wrapper: requires main model to be loaded
+void MPSGraphEngine::load_retrieval(const std::string& retrieval_path) {
+    if (!is_loaded_) {
+        throw std::runtime_error("Main model not loaded. Use load_retrieval(model_path, retrieval_path) for standalone mode.");
+    }
+    // Weight sharing mode - only load whitening weights
+    load_retrieval("", retrieval_path);
+}
+
+// Main function: handles both weight sharing and standalone modes
+void MPSGraphEngine::load_retrieval(const std::string& model_path, const std::string& retrieval_path) {
+    if (@available(macOS 15.0, *)) {
+        @autoreleasepool {
+            // Load retrieval.safetensors (only ~8MB for whitening weights)
+            safetensors::SafetensorsFile retrieval_file(retrieval_path);
+
+            // Check for required weights
+            if (!retrieval_file.has_tensor("prewhiten.m") || !retrieval_file.has_tensor("prewhiten.p")) {
+                throw std::runtime_error("Missing prewhiten.m or prewhiten.p in retrieval weights");
+            }
+
+            ModelConfig cfg = ModelConfig::from_variant(config_.variant);
+            const int IMG_H = config_.resolution;
+            const int IMG_W = static_cast<int>(config_.resolution * 4.0f / 3.0f);
+            const int PATCH_H = IMG_H / cfg.patch_size;
+            const int PATCH_W = IMG_W / cfg.patch_size;
+            const int NUM_PATCHES = PATCH_H * PATCH_W;
+
+            // Load whitening weights
+            auto m_data = retrieval_file.load_tensor_f32("prewhiten.m");
+            auto p_data = retrieval_file.load_tensor_f32("prewhiten.p");
+            NSData* m_nsdata = [NSData dataWithBytes:m_data.data() length:m_data.size() * sizeof(float)];
+            NSData* p_nsdata = [NSData dataWithBytes:p_data.data() length:p_data.size() * sizeof(float)];
+
+            if (is_loaded_) {
+                // ================================================================
+                // WEIGHT SHARING MODE: main model loaded
+                // Create small whitening graph (reuses encoder from main graph!)
+                // This saves ~500MB of duplicated encoder weights
+                // ================================================================
+
+                whitening_graph_ = ctx_->create_graph();
+
+                MPSGraphTensor* whiten_m = [whitening_graph_ constantWithData:m_nsdata
+                                                                        shape:@[@1, @(cfg.enc_dim)]
+                                                                     dataType:MPSDataTypeFloat32];
+                MPSGraphTensor* whiten_p = [whitening_graph_ constantWithData:p_nsdata
+                                                                        shape:@[@(cfg.enc_dim), @(cfg.enc_dim)]
+                                                                     dataType:MPSDataTypeFloat32];
+
+                // Input: encoder features [N, D] from main graph
+                whitening_input_ = [whitening_graph_ placeholderWithShape:@[@(NUM_PATCHES), @(cfg.enc_dim)]
+                                                                 dataType:MPSDataTypeFloat32 name:@"enc_features"];
+
+                // Whitening: (enc_out - m) @ P
+                MPSGraphTensor* centered = [whitening_graph_ subtractionWithPrimaryTensor:whitening_input_
+                                                                          secondaryTensor:whiten_m name:nil];
+                MPSGraphTensor* whitened = [whitening_graph_ matrixMultiplicationWithPrimaryTensor:centered
+                                                                                   secondaryTensor:whiten_p name:nil];
+                whitening_output_ = whitened;  // [N, D]
+
+                // L2 attention: ||x||² / sum(||x||²)
+                MPSGraphTensor* sq = [whitening_graph_ squareWithTensor:whitened name:nil];
+                MPSGraphTensor* l2_sq = [whitening_graph_ reductionSumWithTensor:sq axis:-1 name:nil];
+                MPSGraphTensor* total = [whitening_graph_ reductionSumWithTensor:l2_sq axes:@[@0] name:nil];
+                total = [whitening_graph_ reshapeTensor:total withShape:@[@1] name:nil];
+                MPSGraphTensor* eps = [whitening_graph_ constantWithScalar:1e-8 shape:@[@1] dataType:MPSDataTypeFloat32];
+                total = [whitening_graph_ additionWithPrimaryTensor:total secondaryTensor:eps name:nil];
+                whitening_attention_ = [whitening_graph_ divisionWithPrimaryTensor:l2_sq secondaryTensor:total name:nil];
+
+                is_retrieval_standalone_ = false;
+
+            } else {
+                // ================================================================
+                // STANDALONE MODE: build encoder + whitening graph
+                // Uses ~250MB for encoder only (no decoder)
+                // ================================================================
+
+                if (model_path.empty()) {
+                    throw std::runtime_error("model_path required for standalone retrieval mode");
+                }
+
+                // Load encoder weights from model file
+                safetensors::MultiSafetensorsFile files;
+                std::ifstream test_file(model_path);
+                if (test_file.good()) {
+                    std::string dir = model_path.substr(0, model_path.rfind('/'));
+                    files.add_directory(dir);
+                } else {
+                    files.add_directory(model_path);
+                }
+
+                retrieval_graph_ = ctx_->create_graph();
+                GraphBuilder gb(retrieval_graph_, ctx_->device(), &files);
+
+                // Load ONLY encoder weights (no decoder)
+                std::string pe = cfg.patch_embed_key();
+                auto patch_w = gb.load(pe+"weight", @[@(cfg.enc_dim), @3, @(cfg.patch_size), @(cfg.patch_size)]);
+                auto patch_b = gb.load(pe+"bias", @[@(cfg.enc_dim)]);
+
+                struct EncL { MPSGraphTensor *n1w,*n1b,*qkvw,*qkvb,*pw,*pb,*n2w,*n2b,*f1w,*f1b,*f2w,*f2b; };
+                std::vector<EncL> enc(cfg.enc_depth);
+
+                std::string en = cfg.enc_norm_key();
+                auto enc_nw = gb.load(en+"weight", @[@(cfg.enc_dim)]);
+                auto enc_nb = gb.load(en+"bias", @[@(cfg.enc_dim)]);
+
+                for (int i = 0; i < cfg.enc_depth; i++) {
+                    std::string p = cfg.enc_block_key(i);
+                    enc[i] = {
+                        gb.load(p+"norm1.weight", @[@(cfg.enc_dim)]),
+                        gb.load(p+"norm1.bias", @[@(cfg.enc_dim)]),
+                        gb.load(p+"attn.qkv.weight", @[@(3*cfg.enc_dim), @(cfg.enc_dim)]),
+                        gb.load(p+"attn.qkv.bias", @[@(3*cfg.enc_dim)]),
+                        gb.load(p+"attn.proj.weight", @[@(cfg.enc_dim), @(cfg.enc_dim)]),
+                        gb.load(p+"attn.proj.bias", @[@(cfg.enc_dim)]),
+                        gb.load(p+"norm2.weight", @[@(cfg.enc_dim)]),
+                        gb.load(p+"norm2.bias", @[@(cfg.enc_dim)]),
+                        gb.load(p+"mlp.fc1.weight", @[@(cfg.enc_mlp), @(cfg.enc_dim)]),
+                        gb.load(p+"mlp.fc1.bias", @[@(cfg.enc_mlp)]),
+                        gb.load(p+"mlp.fc2.weight", @[@(cfg.enc_dim), @(cfg.enc_mlp)]),
+                        gb.load(p+"mlp.fc2.bias", @[@(cfg.enc_dim)])
+                    };
+                }
+
+                // Whitening weights
+                MPSGraphTensor* whiten_m = [retrieval_graph_ constantWithData:m_nsdata
+                                                                        shape:@[@1, @(cfg.enc_dim)]
+                                                                     dataType:MPSDataTypeFloat32];
+                MPSGraphTensor* whiten_p = [retrieval_graph_ constantWithData:p_nsdata
+                                                                        shape:@[@(cfg.enc_dim), @(cfg.enc_dim)]
+                                                                     dataType:MPSDataTypeFloat32];
+
+                // Build graph: input → encoder → whitening → attention
+                retrieval_input_ = [retrieval_graph_ placeholderWithShape:@[@1, @(IMG_H), @(IMG_W), @3]
+                                                                 dataType:MPSDataTypeUInt8 name:@"image_uint8"];
+
+                MPSGraphTensor* normalized = gb.imagenet_normalize(retrieval_input_);
+
+                // Patch embedding
+                MPSGraphTensor* patches = gb.conv2d(normalized, patch_w, patch_b, cfg.patch_size, 0);
+                patches = [retrieval_graph_ reshapeTensor:patches withShape:@[@(NUM_PATCHES), @(cfg.enc_dim)] name:nil];
+
+                // Encoder
+                MPSGraphTensor* x = patches;
+                for (int i = 0; i < cfg.enc_depth; i++) {
+                    auto& L = enc[i];
+                    MPSGraphTensor* res = x;
+                    x = gb.layer_norm(x, L.n1w, L.n1b);
+                    x = gb.self_attention(x, L.qkvw, L.qkvb, L.pw, L.pb, cfg.enc_heads, cfg.enc_head_dim);
+                    x = gb.add(x, res);
+                    res = x;
+                    x = gb.layer_norm(x, L.n2w, L.n2b);
+                    x = gb.linear(x, L.f1w, L.f1b);
+                    x = gb.gelu(x);
+                    x = gb.linear(x, L.f2w, L.f2b);
+                    x = gb.add(x, res);
+                }
+                x = gb.layer_norm(x, enc_nw, enc_nb);
+                MPSGraphTensor* enc_out = x;  // [N, D]
+
+                // Whitening: (enc_out - m) @ P
+                MPSGraphTensor* centered = [retrieval_graph_ subtractionWithPrimaryTensor:enc_out
+                                                                          secondaryTensor:whiten_m name:nil];
+                MPSGraphTensor* whitened = [retrieval_graph_ matrixMultiplicationWithPrimaryTensor:centered
+                                                                                   secondaryTensor:whiten_p name:nil];
+                retrieval_features_ = whitened;  // [N, D]
+
+                // L2 attention: ||x||² / sum(||x||²)
+                MPSGraphTensor* sq = [retrieval_graph_ squareWithTensor:whitened name:nil];
+                MPSGraphTensor* l2_sq = [retrieval_graph_ reductionSumWithTensor:sq axis:-1 name:nil];
+                MPSGraphTensor* total = [retrieval_graph_ reductionSumWithTensor:l2_sq axes:@[@0] name:nil];
+                total = [retrieval_graph_ reshapeTensor:total withShape:@[@1] name:nil];
+                MPSGraphTensor* eps = [retrieval_graph_ constantWithScalar:1e-8 shape:@[@1] dataType:MPSDataTypeFloat32];
+                total = [retrieval_graph_ additionWithPrimaryTensor:total secondaryTensor:eps name:nil];
+                retrieval_attention_ = [retrieval_graph_ divisionWithPrimaryTensor:l2_sq secondaryTensor:total name:nil];
+
+                is_retrieval_standalone_ = true;
+            }
+
+            is_retrieval_loaded_ = true;
+        }
+    }
+}
+
+RetrievalResult MPSGraphEngine::encode_retrieval(const ImageView& img) {
+    RetrievalResult result;
+
+    if (!is_retrieval_loaded_) {
+        throw std::runtime_error("Retrieval weights not loaded. Call load_retrieval() first.");
+    }
+
+    if (@available(macOS 15.0, *)) {
+        @autoreleasepool {
+            auto total_start = std::chrono::high_resolution_clock::now();
+
+            ModelConfig cfg = ModelConfig::from_variant(config_.variant);
+            const int IMG_H = config_.resolution;
+            const int IMG_W = static_cast<int>(config_.resolution * 4.0f / 3.0f);
+            const int PATCH_H = IMG_H / cfg.patch_size;
+            const int PATCH_W = IMG_W / cfg.patch_size;
+            const int NUM_PATCHES = PATCH_H * PATCH_W;
+
+            // Create tensor data (uint8 for GPU preprocessing)
+            MPSNDArrayDescriptor* img_desc = [MPSNDArrayDescriptor descriptorWithDataType:MPSDataTypeUInt8
+                                                                                    shape:@[@1, @(IMG_H), @(IMG_W), @3]];
+            MPSNDArray* img_arr = [[MPSNDArray alloc] initWithDevice:ctx_->device() descriptor:img_desc];
+            [img_arr writeBytes:(void*)img.data strideBytes:nil];
+            MPSGraphTensorData* img_td = [[MPSGraphTensorData alloc] initWithMPSNDArray:img_arr];
+
+            if (is_retrieval_standalone_) {
+                // ================================================================
+                // STANDALONE MODE: single graph (encoder + whitening)
+                // ================================================================
+                auto encoder_start = std::chrono::high_resolution_clock::now();
+                NSDictionary* results = [retrieval_graph_ runWithMTLCommandQueue:ctx_->queue()
+                                                                           feeds:@{retrieval_input_: img_td}
+                                                                   targetTensors:@[retrieval_features_, retrieval_attention_]
+                                                                targetOperations:nil];
+                auto encoder_end = std::chrono::high_resolution_clock::now();
+
+                // Copy results
+                result.num_patches = NUM_PATCHES;
+                result.feature_dim = cfg.enc_dim;
+
+                size_t feat_size = NUM_PATCHES * cfg.enc_dim;
+                result.features = new float[feat_size];
+                result.attention = new float[NUM_PATCHES];
+
+                [[results[retrieval_features_] mpsndarray] readBytes:result.features strideBytes:nil];
+                [[results[retrieval_attention_] mpsndarray] readBytes:result.attention strideBytes:nil];
+
+                auto total_end = std::chrono::high_resolution_clock::now();
+
+                result.preprocess_ms = 0.0;  // GPU preprocessing
+                result.encoder_ms = std::chrono::duration<double, std::milli>(encoder_end - encoder_start).count();
+                result.whiten_ms = 0.0;  // Included in encoder_ms for standalone
+                result.total_ms = std::chrono::duration<double, std::milli>(total_end - total_start).count();
+
+            } else {
+                // ================================================================
+                // WEIGHT SHARING MODE: main graph encoder + whitening graph
+                // ================================================================
+
+                // Step 1: Run MAIN graph with encoder output only (reuses existing encoder!)
+                // MPSGraph only executes operations needed for target tensors
+                auto encoder_start = std::chrono::high_resolution_clock::now();
+                NSDictionary* enc_results = [graph_ runWithMTLCommandQueue:ctx_->queue()
+                                                                     feeds:@{input_placeholder_: img_td}
+                                                             targetTensors:@[output_enc_features_]  // Encoder only!
+                                                          targetOperations:nil];
+                auto encoder_end = std::chrono::high_resolution_clock::now();
+
+                // Step 2: Run whitening graph on encoder output
+                auto whiten_start = std::chrono::high_resolution_clock::now();
+                MPSGraphTensorData* enc_td = enc_results[output_enc_features_];
+                NSDictionary* whiten_results = [whitening_graph_ runWithMTLCommandQueue:ctx_->queue()
+                                                                                  feeds:@{whitening_input_: enc_td}
+                                                                          targetTensors:@[whitening_output_, whitening_attention_]
+                                                                       targetOperations:nil];
+                auto whiten_end = std::chrono::high_resolution_clock::now();
+
+                // Copy results
+                result.num_patches = NUM_PATCHES;
+                result.feature_dim = cfg.enc_dim;
+
+                size_t feat_size = NUM_PATCHES * cfg.enc_dim;
+                result.features = new float[feat_size];
+                result.attention = new float[NUM_PATCHES];
+
+                [[whiten_results[whitening_output_] mpsndarray] readBytes:result.features strideBytes:nil];
+                [[whiten_results[whitening_attention_] mpsndarray] readBytes:result.attention strideBytes:nil];
+
+                auto total_end = std::chrono::high_resolution_clock::now();
+
+                result.preprocess_ms = 0.0;  // GPU preprocessing
+                result.encoder_ms = std::chrono::duration<double, std::milli>(encoder_end - encoder_start).count();
+                result.whiten_ms = std::chrono::duration<double, std::milli>(whiten_end - whiten_start).count();
+                result.total_ms = std::chrono::duration<double, std::milli>(total_end - total_start).count();
+            }
+        }
+    }
 
     return result;
 }

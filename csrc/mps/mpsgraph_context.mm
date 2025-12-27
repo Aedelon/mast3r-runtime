@@ -14,32 +14,61 @@ std::shared_ptr<MPSGraphContext> MPSGraphContext::shared_instance_;
 std::mutex MPSGraphContext::shared_mutex_;
 
 // ============================================================================
-// BufferPool Implementation
+// BufferPool Implementation (Size-Class Pool for O(1) allocation)
 // ============================================================================
 
-BufferPool::BufferPool(id<MTLDevice> device, size_t max_buffers)
-    : device_(device), max_buffers_(max_buffers) {}
+BufferPool::BufferPool(id<MTLDevice> device, size_t max_per_class)
+    : device_(device), max_per_class_(max_per_class) {}
 
 BufferPool::~BufferPool() {
     clear();
 }
 
+size_t BufferPool::next_power_of_2(size_t n) {
+    if (n == 0) return 1ULL << MIN_SIZE_CLASS;
+    n--;
+    n |= n >> 1;
+    n |= n >> 2;
+    n |= n >> 4;
+    n |= n >> 8;
+    n |= n >> 16;
+    n |= n >> 32;
+    n++;
+    // Clamp to min/max size class
+    if (n < (1ULL << MIN_SIZE_CLASS)) n = 1ULL << MIN_SIZE_CLASS;
+    if (n > (1ULL << MAX_SIZE_CLASS)) n = 1ULL << MAX_SIZE_CLASS;
+    return n;
+}
+
+size_t BufferPool::size_class_index(size_t size) {
+    size_t power = next_power_of_2(size);
+    // Count trailing zeros to get log2
+    size_t log2 = 0;
+    while ((power >> log2) > 1) log2++;
+    // Clamp to valid range
+    if (log2 < MIN_SIZE_CLASS) log2 = MIN_SIZE_CLASS;
+    if (log2 > MAX_SIZE_CLASS) log2 = MAX_SIZE_CLASS;
+    return log2 - MIN_SIZE_CLASS;
+}
+
 id<MTLBuffer> BufferPool::acquire(size_t size) {
     std::lock_guard<std::mutex> lock(mutex_);
 
-    // Find a buffer that fits
-    for (auto it = available_.begin(); it != available_.end(); ++it) {
-        if ([*it length] >= size) {
-            id<MTLBuffer> buffer = *it;
-            available_.erase(it);
-            return buffer;
-        }
+    size_t idx = size_class_index(size);
+    auto& pool = pools_[idx];
+
+    // O(1) pop from size class
+    if (!pool.empty()) {
+        id<MTLBuffer> buffer = pool.back();
+        pool.pop_back();
+        return buffer;
     }
 
-    // Create new buffer
-    id<MTLBuffer> buffer = [device_ newBufferWithLength:size
+    // Allocate new buffer at size class granularity
+    size_t alloc_size = 1ULL << (idx + MIN_SIZE_CLASS);
+    id<MTLBuffer> buffer = [device_ newBufferWithLength:alloc_size
                                                 options:MTLResourceStorageModeShared];
-    total_bytes_ += size;
+    total_bytes_ += alloc_size;
     return buffer;
 }
 
@@ -48,8 +77,11 @@ void BufferPool::release(id<MTLBuffer> buffer) {
 
     std::lock_guard<std::mutex> lock(mutex_);
 
-    if (available_.size() < max_buffers_) {
-        available_.push_back(buffer);
+    size_t idx = size_class_index([buffer length]);
+    auto& pool = pools_[idx];
+
+    if (pool.size() < max_per_class_) {
+        pool.push_back(buffer);
     } else {
         // Pool full, let buffer be deallocated
         total_bytes_ -= [buffer length];
@@ -58,8 +90,35 @@ void BufferPool::release(id<MTLBuffer> buffer) {
 
 void BufferPool::clear() {
     std::lock_guard<std::mutex> lock(mutex_);
-    available_.clear();
+    for (auto& pool : pools_) {
+        pool.clear();
+    }
     total_bytes_ = 0;
+}
+
+void BufferPool::warmup(const std::vector<size_t>& expected_sizes) {
+    std::lock_guard<std::mutex> lock(mutex_);
+
+    for (size_t size : expected_sizes) {
+        size_t idx = size_class_index(size);
+        size_t alloc_size = 1ULL << (idx + MIN_SIZE_CLASS);
+
+        // Pre-allocate 2 buffers per size class for double-buffering
+        for (int i = 0; i < 2; i++) {
+            id<MTLBuffer> buffer = [device_ newBufferWithLength:alloc_size
+                                                        options:MTLResourceStorageModeShared];
+            pools_[idx].push_back(buffer);
+            total_bytes_ += alloc_size;
+        }
+    }
+}
+
+size_t BufferPool::pooled_count() const {
+    size_t count = 0;
+    for (const auto& pool : pools_) {
+        count += pool.size();
+    }
+    return count;
 }
 
 // ============================================================================

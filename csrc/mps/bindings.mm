@@ -52,6 +52,13 @@ struct PyMatchResult {
     py::dict timing;
 };
 
+// Python wrapper for RetrievalResult
+struct PyRetrievalResult {
+    py::array_t<float> features;   // [N, D] whitened features
+    py::array_t<float> attention;  // [N] L2 attention scores
+    py::dict timing;
+};
+
 // Python wrapper class
 class PyMPSEngine {
 public:
@@ -203,6 +210,50 @@ public:
         return py_result;
     }
 
+    // Weight sharing mode (requires main model loaded)
+    void load_retrieval(const std::string& retrieval_path) {
+        engine_->load_retrieval(retrieval_path);
+    }
+
+    // Standalone mode (encoder + whitening only, no main model needed)
+    void load_retrieval_standalone(const std::string& model_path, const std::string& retrieval_path) {
+        engine_->load_retrieval(model_path, retrieval_path);
+    }
+
+    bool is_retrieval_ready() const {
+        return engine_->is_retrieval_ready();
+    }
+
+    bool is_retrieval_standalone() const {
+        return engine_->is_retrieval_standalone();
+    }
+
+    PyRetrievalResult encode_retrieval(py::array_t<uint8_t> img) {
+        auto view = numpy_to_image_view(img);
+        auto result = engine_->encode_retrieval(view);
+
+        PyRetrievalResult py_result;
+
+        const int N = result.num_patches;
+        const int D = result.feature_dim;
+
+        py_result.features = py::array_t<float>({N, D});
+        py_result.attention = py::array_t<float>(N);
+
+        std::memcpy(py_result.features.mutable_data(), result.features, N * D * sizeof(float));
+        std::memcpy(py_result.attention.mutable_data(), result.attention, N * sizeof(float));
+
+        // Clean up C++ allocations
+        delete[] result.features;
+        delete[] result.attention;
+
+        py_result.timing["preprocess_ms"] = result.preprocess_ms;
+        py_result.timing["encoder_ms"] = result.encoder_ms;
+        py_result.timing["total_ms"] = result.total_ms;
+
+        return py_result;
+    }
+
 private:
     std::unique_ptr<MPSGraphEngine> engine_;
 };
@@ -230,6 +281,11 @@ PYBIND11_MODULE(_mps, m) {
         .def_readonly("confidence", &PyMatchResult::confidence)
         .def_readonly("timing", &PyMatchResult::timing);
 
+    py::class_<PyRetrievalResult>(m, "RetrievalResult")
+        .def_readonly("features", &PyRetrievalResult::features)
+        .def_readonly("attention", &PyRetrievalResult::attention)
+        .def_readonly("timing", &PyRetrievalResult::timing);
+
     py::class_<PyMPSEngine>(m, "MPSEngine")
         .def(py::init<const std::string&, int, const std::string&, int>(),
              py::arg("variant") = "mast3r_vit_large",
@@ -246,7 +302,16 @@ PYBIND11_MODULE(_mps, m) {
              py::arg("desc_2"),
              py::arg("top_k") = 512,
              py::arg("reciprocal") = true,
-             py::arg("confidence_threshold") = 0.5f);
+             py::arg("confidence_threshold") = 0.5f)
+        .def("load_retrieval", &PyMPSEngine::load_retrieval,
+             py::arg("retrieval_path"),
+             "Load retrieval weights (requires main model loaded for weight sharing)")
+        .def("load_retrieval_standalone", &PyMPSEngine::load_retrieval_standalone,
+             py::arg("model_path"), py::arg("retrieval_path"),
+             "Load retrieval in standalone mode (encoder + whitening only, no main model needed)")
+        .def("is_retrieval_ready", &PyMPSEngine::is_retrieval_ready)
+        .def("is_retrieval_standalone", &PyMPSEngine::is_retrieval_standalone)
+        .def("encode_retrieval", &PyMPSEngine::encode_retrieval);
 
     // Module info
     m.def("is_available", []() {

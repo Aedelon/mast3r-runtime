@@ -6,6 +6,7 @@
 
 #import <Metal/Metal.h>
 #import <MetalPerformanceShadersGraph/MetalPerformanceShadersGraph.h>
+#include <array>
 #include <memory>
 #include <mutex>
 #include <vector>
@@ -20,10 +21,10 @@ namespace mpsgraph {
 
 class API_AVAILABLE(macos(15.0)) BufferPool {
 public:
-    explicit BufferPool(id<MTLDevice> device, size_t max_buffers = 32);
+    explicit BufferPool(id<MTLDevice> device, size_t max_per_class = 4);
     ~BufferPool();
 
-    // Acquire a buffer of at least the given size
+    // Acquire a buffer of at least the given size (O(1) with size classes)
     id<MTLBuffer> acquire(size_t size);
 
     // Release a buffer back to the pool
@@ -32,15 +33,31 @@ public:
     // Clear all pooled buffers
     void clear();
 
+    // Warmup: pre-allocate buffers for expected sizes
+    void warmup(const std::vector<size_t>& expected_sizes);
+
     // Stats
-    size_t pooled_count() const { return available_.size(); }
+    size_t pooled_count() const;
     size_t total_bytes() const { return total_bytes_; }
 
 private:
+    // Round up to next power of 2 for size class
+    static size_t next_power_of_2(size_t n);
+
+    // Get size class index (log2 of power of 2)
+    static size_t size_class_index(size_t size);
+
     id<MTLDevice> device_;
-    std::vector<id<MTLBuffer>> available_;
+
+    // Size-class pools: index = log2(size), each holds buffers of that size class
+    // Classes: 4KB, 8KB, 16KB, 32KB, 64KB, 128KB, 256KB, 512KB, 1MB, 2MB, 4MB, 8MB, 16MB, 32MB, 64MB, 128MB, 256MB, 512MB
+    static constexpr size_t MIN_SIZE_CLASS = 12;  // 4KB = 2^12
+    static constexpr size_t MAX_SIZE_CLASS = 29;  // 512MB = 2^29
+    static constexpr size_t NUM_SIZE_CLASSES = MAX_SIZE_CLASS - MIN_SIZE_CLASS + 1;
+
+    std::array<std::vector<id<MTLBuffer>>, NUM_SIZE_CLASSES> pools_;
     std::mutex mutex_;
-    size_t max_buffers_;
+    size_t max_per_class_;
     size_t total_bytes_ = 0;
 };
 

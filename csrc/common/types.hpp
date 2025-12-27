@@ -146,6 +146,25 @@ struct MatchResult {
     size_t num_matches() const { return idx_1.size(); }
 };
 
+// Retrieval result (encoder-only with whitening)
+struct RetrievalResult {
+    // Whitened features [N, D] where N=num_patches, D=1024 for ViT-Large
+    float* features = nullptr;
+
+    // L2 attention scores [N] for top-k selection
+    float* attention = nullptr;
+
+    // Dimensions
+    int num_patches = 0;
+    int feature_dim = 0;
+
+    // Timing
+    float preprocess_ms = 0.0f;
+    float encoder_ms = 0.0f;
+    float whiten_ms = 0.0f;
+    float total_ms = 0.0f;
+};
+
 // Tensor data type
 enum class DType { F32, F16, BF16, I64, I32, I16, I8, U8 };
 
