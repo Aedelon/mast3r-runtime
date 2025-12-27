@@ -115,8 +115,14 @@ def benchmark_inference(
 def benchmark_batch_pipelined(
     engine, images: list, warmup: int = 2, iterations: int = 5
 ) -> BenchmarkResult:
-    """Benchmark batch pipelined inference."""
+    """Benchmark batch pipelined inference.
+
+    With batch=2 architecture, this processes consecutive pairs:
+    - N images → N-1 pairs: (img[0],img[1]), (img[1],img[2]), ...
+    - Each pair produces 2 outputs (one per image in the pair)
+    """
     n_images = len(images)
+    n_pairs = n_images - 1  # New: returns N-1 pairs for N images
 
     # Warmup
     for _ in range(warmup):
@@ -125,21 +131,23 @@ def benchmark_batch_pipelined(
     times = []
     for _ in range(iterations):
         t0 = time.perf_counter()
-        _ = engine.infer_batch_pipelined(images)
+        results = engine.infer_batch_pipelined(images)
         times.append((time.perf_counter() - t0) * 1000)
 
     times = np.array(times)
-    per_image = times / n_images
+    # Each pair processes 2 images, so total images = n_pairs * 2
+    # But with overlap, effective images processed = n_images
+    per_pair = times / n_pairs
 
     return BenchmarkResult(
         model="",
-        mode=f"batch_pipelined (x{n_images})",
+        mode=f"batch_pipelined ({n_pairs} pairs)",
         iterations=iterations,
-        mean_ms=float(np.mean(per_image)),
-        std_ms=float(np.std(per_image)),
-        min_ms=float(np.min(per_image)),
-        max_ms=float(np.max(per_image)),
-        throughput=n_images * 1000.0 / float(np.mean(times)),
+        mean_ms=float(np.mean(per_pair)),
+        std_ms=float(np.std(per_pair)),
+        min_ms=float(np.min(per_pair)),
+        max_ms=float(np.max(per_pair)),
+        throughput=n_pairs * 2 * 1000.0 / float(np.mean(times)),  # 2 images per pair
     )
 
 
