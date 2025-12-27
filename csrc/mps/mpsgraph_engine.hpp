@@ -141,20 +141,30 @@ private:
     MPSGraphExecutable* retrieval_executable_ = nil; // Standalone retrieval
 
     // Placeholders (uint8 input for GPU preprocessing)
-    MPSGraphTensor* input_placeholder_ = nil;  // [1, H, W, 3] uint8
+    MPSGraphTensor* input_placeholder_ = nil;  // [2, H, W, 3] uint8 - batch of 2 images
 
-    // Output tensors
+    // Output tensors for image 1
     MPSGraphTensor* output_pts3d_conf_ = nil;  // [1, H, W, 4] combined (legacy)
     MPSGraphTensor* output_pts3d_ = nil;       // [1, H, W, 3] split in graph
     MPSGraphTensor* output_conf_ = nil;        // [1, H, W] split in graph
     MPSGraphTensor* output_descriptors_ = nil;
     MPSGraphTensor* output_enc_features_ = nil;  // Encoder output [N, D] for retrieval
 
+    // Output tensors for image 2 (batch=2 architecture)
+    MPSGraphTensor* output_pts3d_2_ = nil;       // [1, H, W, 3]
+    MPSGraphTensor* output_conf_2_ = nil;        // [1, H, W]
+    MPSGraphTensor* output_descriptors_2_ = nil;
+
     // Whitening graph (small, reuses encoder from main graph when available)
     MPSGraph* whitening_graph_ = nil;
     MPSGraphTensor* whitening_input_ = nil;     // [N, D] encoder features
     MPSGraphTensor* whitening_output_ = nil;    // [N, D] whitened features
     MPSGraphTensor* whitening_attention_ = nil; // [N] L2 attention scores
+
+    // Single-image encoder path in main graph (TRUE weight sharing)
+    // Uses same weight tensors as batch=2 encoder, different input placeholder
+    MPSGraphTensor* single_img_input_ = nil;      // [1, H, W, 3] uint8
+    MPSGraphTensor* single_img_enc_output_ = nil; // [NUM_PATCHES, enc_dim]
 
     // Standalone retrieval graph (encoder + whitening, used when main model not loaded)
     MPSGraph* retrieval_graph_ = nil;
