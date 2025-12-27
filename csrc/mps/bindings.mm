@@ -1,16 +1,16 @@
-// MASt3R Runtime - Metal Backend Python Bindings
+// MASt3R Runtime - MPS Backend Python Bindings
 // Copyright 2024 Delanoe Pirard / Aedelon. Apache 2.0.
 
 #include <pybind11/pybind11.h>
 #include <pybind11/numpy.h>
 #include <pybind11/stl.h>
 
-#include "metal_engine.hpp"
-#include "metal_context.hpp"
+#include "mpsgraph_context.hpp"
+#include "mpsgraph_engine.hpp"
 
 namespace py = pybind11;
 using namespace mast3r;
-using namespace mast3r::metal;
+using namespace mast3r::mpsgraph;
 
 // Helper to convert numpy array to ImageView
 ImageView numpy_to_image_view(py::array_t<uint8_t> arr) {
@@ -53,9 +53,9 @@ struct PyMatchResult {
 };
 
 // Python wrapper class
-class PyMetalEngine {
+class PyMPSEngine {
 public:
-    PyMetalEngine(
+    PyMPSEngine(
         const std::string& variant,
         int resolution,
         const std::string& precision,
@@ -87,7 +87,7 @@ public:
             config.precision = Precision::INT8;
         }
 
-        engine_ = std::make_unique<MetalEngine>(config);
+        engine_ = std::make_unique<MPSGraphEngine>(config);
     }
 
     void load(const std::string& model_path) {
@@ -121,8 +121,6 @@ public:
         const int W = result.width;
         const int D = result.desc_dim;
 
-        // For Metal, we can potentially use zero-copy with numpy
-        // But for safety, we copy here
         py_result.pts3d_1 = py::array_t<float>({H, W, 3});
         py_result.pts3d_2 = py::array_t<float>({H, W, 3});
         py_result.desc_1 = py::array_t<float>({H, W, D});
@@ -136,6 +134,14 @@ public:
         std::memcpy(py_result.desc_2.mutable_data(), result.desc_2, H * W * D * sizeof(float));
         std::memcpy(py_result.conf_1.mutable_data(), result.conf_1, H * W * sizeof(float));
         std::memcpy(py_result.conf_2.mutable_data(), result.conf_2, H * W * sizeof(float));
+
+        // Clean up C++ allocations
+        delete[] result.pts3d_1;
+        delete[] result.pts3d_2;
+        delete[] result.desc_1;
+        delete[] result.desc_2;
+        delete[] result.conf_1;
+        delete[] result.conf_2;
 
         py_result.timing["preprocess_ms"] = result.preprocess_ms;
         py_result.timing["inference_ms"] = result.inference_ms;
@@ -189,8 +195,6 @@ public:
             std::memcpy(py_result.idx_2.mutable_data(), result.idx_2.data(), N * sizeof(int64_t));
             std::memcpy(py_result.pts2d_1.mutable_data(), result.pts2d_1.data(), N * 2 * sizeof(float));
             std::memcpy(py_result.pts2d_2.mutable_data(), result.pts2d_2.data(), N * 2 * sizeof(float));
-            std::memcpy(py_result.pts3d_1.mutable_data(), result.pts3d_1.data(), N * 3 * sizeof(float));
-            std::memcpy(py_result.pts3d_2.mutable_data(), result.pts3d_2.data(), N * 3 * sizeof(float));
             std::memcpy(py_result.confidence.mutable_data(), result.confidence.data(), N * sizeof(float));
         }
 
@@ -200,12 +204,12 @@ public:
     }
 
 private:
-    std::unique_ptr<MetalEngine> engine_;
+    std::unique_ptr<MPSGraphEngine> engine_;
 };
 
 
-PYBIND11_MODULE(_metal, m) {
-    m.doc() = "MASt3R Runtime Metal Backend (Apple Silicon)";
+PYBIND11_MODULE(_mps, m) {
+    m.doc() = "MASt3R Runtime MPS Backend (Apple Silicon with MPSGraph SDPA)";
 
     py::class_<PyInferenceResult>(m, "InferenceResult")
         .def_readonly("pts3d_1", &PyInferenceResult::pts3d_1)
@@ -226,18 +230,18 @@ PYBIND11_MODULE(_metal, m) {
         .def_readonly("confidence", &PyMatchResult::confidence)
         .def_readonly("timing", &PyMatchResult::timing);
 
-    py::class_<PyMetalEngine>(m, "MetalEngine")
+    py::class_<PyMPSEngine>(m, "MPSEngine")
         .def(py::init<const std::string&, int, const std::string&, int>(),
-             py::arg("variant") = "dune_vit_small_336",
-             py::arg("resolution") = 336,
-             py::arg("precision") = "fp16",
+             py::arg("variant") = "mast3r_vit_large",
+             py::arg("resolution") = 512,
+             py::arg("precision") = "fp32",
              py::arg("num_threads") = 4)
-        .def("load", &PyMetalEngine::load)
-        .def("is_ready", &PyMetalEngine::is_ready)
-        .def("name", &PyMetalEngine::name)
-        .def("warmup", &PyMetalEngine::warmup, py::arg("num_iterations") = 3)
-        .def("infer", &PyMetalEngine::infer)
-        .def("match", &PyMetalEngine::match,
+        .def("load", &PyMPSEngine::load)
+        .def("is_ready", &PyMPSEngine::is_ready)
+        .def("name", &PyMPSEngine::name)
+        .def("warmup", &PyMPSEngine::warmup, py::arg("num_iterations") = 3)
+        .def("infer", &PyMPSEngine::infer)
+        .def("match", &PyMPSEngine::match,
              py::arg("desc_1"),
              py::arg("desc_2"),
              py::arg("top_k") = 512,
@@ -246,15 +250,53 @@ PYBIND11_MODULE(_metal, m) {
 
     // Module info
     m.def("is_available", []() {
-        return MetalContext::instance().is_available();
+        return MPSGraphContext::is_available();
     });
     m.def("get_name", []() {
-        return "Metal (" + MetalContext::instance().device_name() + ")";
+        return "MPSGraph SDPA (Apple Silicon)";
     });
+
+    // Context info
     m.def("get_device_name", []() {
-        return MetalContext::instance().device_name();
+        if (@available(macOS 15.0, *)) {
+            return MPSGraphContext::shared()->device_name();
+        }
+        return std::string("unavailable");
     });
-    m.def("has_unified_memory", []() {
-        return MetalContext::instance().has_unified_memory();
+    m.def("get_recommended_working_set_size", []() {
+        if (@available(macOS 15.0, *)) {
+            return MPSGraphContext::shared()->recommended_working_set_size();
+        }
+        return size_t(0);
+    });
+    m.def("get_max_buffer_length", []() {
+        if (@available(macOS 15.0, *)) {
+            return MPSGraphContext::shared()->max_buffer_length();
+        }
+        return size_t(0);
+    });
+    m.def("get_context_info", []() {
+        py::dict info;
+        if (@available(macOS 15.0, *)) {
+            auto ctx = MPSGraphContext::shared();
+            info["device_name"] = ctx->device_name();
+            info["recommended_working_set_size"] = ctx->recommended_working_set_size();
+            info["max_buffer_length"] = ctx->max_buffer_length();
+            info["buffer_pool_count"] = ctx->buffer_pool().pooled_count();
+            info["buffer_pool_bytes"] = ctx->buffer_pool().total_bytes();
+        } else {
+            info["error"] = "macOS 15.0+ required";
+        }
+        return info;
+    });
+    m.def("synchronize", []() {
+        if (@available(macOS 15.0, *)) {
+            MPSGraphContext::shared()->synchronize();
+        }
+    });
+    m.def("clear_buffer_pool", []() {
+        if (@available(macOS 15.0, *)) {
+            MPSGraphContext::shared()->buffer_pool().clear();
+        }
     });
 }

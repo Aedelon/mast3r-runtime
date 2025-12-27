@@ -59,6 +59,7 @@ public:
 
 private:
     RuntimeConfig config_;
+    ModelSpec spec_;
     bool is_loaded_ = false;
 
     // Model weights

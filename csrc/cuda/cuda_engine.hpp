@@ -70,6 +70,7 @@ private:
     std::string variant_;
     int resolution_;
     std::string precision_;
+    ModelSpec spec_;
     bool is_ready_ = false;
 
     // CUDA handles

@@ -24,6 +24,7 @@ class Backend(str, Enum):
     """Available inference backends."""
 
     AUTO = "auto"
+    MPSGRAPH = "mpsgraph"  # Fastest on macOS 15+ (~21x speedup)
     METAL = "metal"
     CUDA = "cuda"
     CPU = "cpu"
@@ -68,7 +69,16 @@ def _detect_backend() -> Backend:
     system = platform.system()
 
     if system == "Darwin":
-        # macOS - try Metal
+        # macOS - prefer MPSGraph (21x faster with native SDPA on macOS 15+)
+        try:
+            from . import _mpsgraph
+
+            if _mpsgraph.is_available():
+                return Backend.MPSGRAPH
+        except ImportError:
+            pass
+
+        # Fallback to Metal kernels
         try:
             from . import _metal
 
@@ -92,7 +102,11 @@ def _detect_backend() -> Backend:
 
 def _get_backend_module(backend: Backend):
     """Get the backend module."""
-    if backend == Backend.METAL:
+    if backend == Backend.MPSGRAPH:
+        from . import _mpsgraph
+
+        return _mpsgraph
+    elif backend == Backend.METAL:
         from . import _metal
 
         return _metal
@@ -181,7 +195,14 @@ class Engine:
         """Create the native engine."""
         module = _get_backend_module(self.backend)
 
-        if self.backend == Backend.METAL:
+        if self.backend == Backend.MPSGRAPH:
+            return module.MPSGraphEngine(
+                variant=self.variant,
+                resolution=self.resolution,
+                precision=self.precision,
+                num_threads=self.num_threads,
+            )
+        elif self.backend == Backend.METAL:
             return module.MetalEngine(
                 variant=self.variant,
                 resolution=self.resolution,
@@ -309,6 +330,15 @@ class Engine:
 def get_available_backends() -> list[Backend]:
     """Get list of available backends on this system."""
     available = []
+
+    # Check MPSGraph (fastest on macOS 15+)
+    try:
+        from . import _mpsgraph
+
+        if _mpsgraph.is_available():
+            available.append(Backend.MPSGRAPH)
+    except ImportError:
+        pass
 
     # Check Metal
     try:

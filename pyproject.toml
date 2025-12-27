@@ -108,7 +108,7 @@ wheel.packages = ["mast3r_runtime"]
 # CMake configuration
 cmake.args = [
     "-DBUILD_TESTS=OFF",
-    "-DBUILD_MPSGRAPH=ON",
+    "-DBUILD_MPS=ON",
 ]
 
 # Build in parallel

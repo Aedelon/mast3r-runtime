@@ -80,6 +80,7 @@ private:
     std::string variant_;
     int resolution_;
     std::string precision_;
+    ModelSpec spec_;
     bool is_ready_ = false;
     int dla_core_ = -1;  // -1 = GPU, 0/1 = DLA core
 

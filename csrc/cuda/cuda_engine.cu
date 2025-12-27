@@ -27,7 +27,8 @@ CUDAEngine::CUDAEngine(
     int resolution,
     const std::string& precision,
     int num_threads
-) : variant_(variant), resolution_(resolution), precision_(precision) {
+) : variant_(variant), resolution_(resolution), precision_(precision),
+    spec_(get_model_spec(parse_variant(variant))) {
 
     // Check CUDA availability
     int device_count = 0;
@@ -173,7 +174,7 @@ InferenceResult CUDAEngine::infer(
 
     InferenceResult result;
     int res = resolution_;
-    int desc_dim = 256;
+    int desc_dim = spec_.desc_dim;
 
     // Allocate outputs
     result.pts3d_1.resize(res * res * 3, 0.0f);

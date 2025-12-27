@@ -14,6 +14,7 @@ namespace cpu {
 
 CPUEngine::CPUEngine(const RuntimeConfig& config)
     : config_(config),
+      spec_(get_model_spec(config.variant)),
       preprocessor_(std::make_unique<Preprocessor>(config.resolution)) {
     allocate_buffers();
 }
@@ -25,9 +26,7 @@ CPUEngine& CPUEngine::operator=(CPUEngine&&) noexcept = default;
 
 void CPUEngine::allocate_buffers() {
     const int res = config_.resolution;
-    const int patch_size = 14;
-    const int num_patches = (res / patch_size) * (res / patch_size);
-    const int desc_dim = 256;  // DUNE descriptor dimension
+    const int desc_dim = spec_.desc_dim;
 
     // Image buffers [1, 3, H, W]
     buffer_img1_.resize(3 * res * res);
@@ -42,9 +41,13 @@ void CPUEngine::allocate_buffers() {
     buffer_conf_2_.resize(res * res);
 }
 
-void CPUEngine::load(const std::string& model_path) {
-    auto loader = ModelLoader::create(WeightFormat::SAFETENSORS);
-    weights_ = loader->load(model_path);
+void CPUEngine::load(const std::string& /* model_path */) {
+    // Load based on architecture type
+    if (spec_.is_mast3r()) {
+        weights_ = load_mast3r_model(config_.precision);
+    } else {
+        weights_ = load_dune_model(config_.variant, config_.precision);
+    }
     is_loaded_ = true;
 }
 
@@ -68,7 +71,7 @@ InferenceResult CPUEngine::infer(const ImageView& img1, const ImageView& img2) {
     InferenceResult result;
     result.height = config_.resolution;
     result.width = config_.resolution;
-    result.desc_dim = 256;
+    result.desc_dim = spec_.desc_dim;
 
     // Preprocessing
     auto t0 = Clock::now();

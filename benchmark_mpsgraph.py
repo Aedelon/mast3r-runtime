@@ -1,5 +1,5 @@
 #!/usr/bin/env python3
-"""Benchmark MPSGraph backend vs Python backend.
+"""Benchmark MPS backend vs Python backend.
 
 Copyright 2024 Delanoe Pirard / Aedelon. Apache 2.0.
 
@@ -37,9 +37,9 @@ def benchmark_python_backend():
     model = MASt3RModel(weights)
     print(f"Model loaded ({len(weights)} tensors)")
 
-    # Test images (384x512 = 4:3 aspect) in BCHW format
-    img1 = np.random.randint(0, 255, (1, 3, 384, 512), dtype=np.uint8)
-    img2 = np.random.randint(0, 255, (1, 3, 384, 512), dtype=np.uint8)
+    # Test images (512x682 = 4:3 aspect) in BCHW format
+    img1 = np.random.randint(0, 255, (1, 3, 512, 682), dtype=np.uint8)
+    img2 = np.random.randint(0, 255, (1, 3, 512, 682), dtype=np.uint8)
 
     # Warmup
     print("Warmup...")
@@ -53,7 +53,7 @@ def benchmark_python_backend():
         result = model.forward(img1, img2)
         elapsed = (time.perf_counter() - start) * 1000
         times.append(elapsed)
-        print(f"  Iter {i+1}: {elapsed:.1f} ms")
+        print(f"  Iter {i + 1}: {elapsed:.1f} ms")
 
     avg = sum(times) / len(times)
     print(f"\nAverage: {avg:.1f} ms")
@@ -61,21 +61,21 @@ def benchmark_python_backend():
     return avg
 
 
-def benchmark_mpsgraph_backend():
-    """Benchmark MPSGraph backend (requires compiled _mpsgraph module)."""
+def benchmark_mps_backend():
+    """Benchmark MPS backend (requires compiled _mps module)."""
     print("\n" + "=" * 60)
-    print("MPSGraph Backend Benchmark")
+    print("MPS Backend Benchmark")
     print("=" * 60)
 
     try:
-        from mast3r_runtime.backends import _mpsgraph
+        from mast3r_runtime.backends import _mps
     except ImportError as e:
-        print(f"MPSGraph backend not available: {e}")
+        print(f"MPS backend not available: {e}")
         print("Build with: uv pip install -e '.[dev]'")
         return None
 
-    if not _mpsgraph.is_available():
-        print("MPSGraph not available (requires macOS 15+)")
+    if not _mps.is_available():
+        print("MPS not available (requires macOS 15+)")
         return None
 
     from mast3r_runtime.core.config import ModelVariant, Precision, get_default_model_path
@@ -85,10 +85,10 @@ def benchmark_mpsgraph_backend():
         print(f"Model not found: {model_path}")
         return None
 
-    print(f"Creating MPSGraph engine...")
-    engine = _mpsgraph.MPSGraphEngine(
+    print(f"Creating MPS engine...")
+    engine = _mps.MPSEngine(
         variant="mast3r_vit_large",
-        resolution=384,
+        resolution=512,
         precision="fp32",
         num_threads=4,
     )
@@ -97,9 +97,9 @@ def benchmark_mpsgraph_backend():
     engine.load(str(model_path))
     print(f"Engine: {engine.name()}")
 
-    # Test images
-    img1 = np.random.randint(0, 255, (384, 512, 3), dtype=np.uint8)
-    img2 = np.random.randint(0, 255, (384, 512, 3), dtype=np.uint8)
+    # Test images (512x682 = 4:3 aspect)
+    img1 = np.random.randint(0, 255, (512, 682, 3), dtype=np.uint8)
+    img2 = np.random.randint(0, 255, (512, 682, 3), dtype=np.uint8)
 
     # Warmup
     print("Warmup (3 iterations)...")
@@ -113,7 +113,7 @@ def benchmark_mpsgraph_backend():
         result = engine.infer(img1, img2)
         elapsed = (time.perf_counter() - start) * 1000
         times.append(elapsed)
-        print(f"  Iter {i+1}: {elapsed:.1f} ms")
+        print(f"  Iter {i + 1}: {elapsed:.1f} ms")
 
     avg = sum(times) / len(times)
     print(f"\nAverage: {avg:.1f} ms")
@@ -127,12 +127,12 @@ def benchmark_mpsgraph_backend():
 
 def main():
     print("\n" + "=" * 60)
-    print("  MASt3R Runtime Benchmark - MPSGraph vs Python")
+    print("  MASt3R Runtime Benchmark - MPS vs Python")
     print("=" * 60 + "\n")
 
     # Run benchmarks
     python_ms = benchmark_python_backend()
-    mpsgraph_ms = benchmark_mpsgraph_backend()
+    mps_ms = benchmark_mps_backend()
 
     # Summary
     print("\n" + "=" * 60)
@@ -140,18 +140,18 @@ def main():
     print("=" * 60)
 
     if python_ms:
-        print(f"Python backend:   {python_ms:.1f} ms/pair")
+        print(f"Python backend: {python_ms:.1f} ms/pair")
     else:
-        print("Python backend:   Not tested")
+        print("Python backend: Not tested")
 
-    if mpsgraph_ms:
-        print(f"MPSGraph backend: {mpsgraph_ms:.1f} ms/pair")
+    if mps_ms:
+        print(f"MPS backend:    {mps_ms:.1f} ms/pair")
     else:
-        print("MPSGraph backend: Not available")
+        print("MPS backend:    Not available")
 
-    if python_ms and mpsgraph_ms:
-        speedup = python_ms / mpsgraph_ms
-        print(f"\nSpeedup: {speedup:.1f}x faster with MPSGraph")
+    if python_ms and mps_ms:
+        speedup = python_ms / mps_ms
+        print(f"\nSpeedup: {speedup:.1f}x faster with MPS")
 
 
 if __name__ == "__main__":

@@ -76,17 +76,18 @@ MODEL_SPECS: dict[ModelVariant, dict] = {
         "depth": 12,
         "native_resolution": 336,
         "hf_repo": HF_REPO_DUNE,
+        "subdir": "dune_vit_small_336",
         "checkpoints": {
             "encoder": {
                 "url": f"{NAVER_CDN_BASE}/dune/dune_vitsmall14_336.pth",
                 "filename": "dune_vitsmall14_336.pth",
-                "hf_filename": "dune_vit_small_336/encoder.safetensors",
+                "hf_filename": "encoder.safetensors",
                 "size_mb": 109,
             },
             "decoder": {
                 "url": f"{NAVER_CDN_BASE}/dune/dunemast3r_cvpr25_vitsmall.pth",
                 "filename": "dunemast3r_cvpr25_vitsmall.pth",
-                "hf_filename": "dune_vit_small_336/decoder.safetensors",
+                "hf_filename": "decoder.safetensors",
                 "size_mb": 1234,
             },
         },
@@ -100,17 +101,18 @@ MODEL_SPECS: dict[ModelVariant, dict] = {
         "depth": 12,
         "native_resolution": 448,
         "hf_repo": HF_REPO_DUNE,
+        "subdir": "dune_vit_small_448",
         "checkpoints": {
             "encoder": {
                 "url": f"{NAVER_CDN_BASE}/dune/dune_vitsmall14_448.pth",
                 "filename": "dune_vitsmall14_448.pth",
-                "hf_filename": "dune_vit_small_448/encoder.safetensors",
+                "hf_filename": "encoder.safetensors",
                 "size_mb": 109,
             },
             "decoder": {
                 "url": f"{NAVER_CDN_BASE}/dune/dunemast3r_cvpr25_vitsmall.pth",
                 "filename": "dunemast3r_cvpr25_vitsmall.pth",
-                "hf_filename": "dune_vit_small_448/decoder.safetensors",
+                "hf_filename": "decoder.safetensors",
                 "size_mb": 1234,
             },
         },
@@ -124,17 +126,18 @@ MODEL_SPECS: dict[ModelVariant, dict] = {
         "depth": 12,
         "native_resolution": 336,
         "hf_repo": HF_REPO_DUNE,
+        "subdir": "dune_vit_base_336",
         "checkpoints": {
             "encoder": {
                 "url": f"{NAVER_CDN_BASE}/dune/dune_vitbase14_336.pth",
                 "filename": "dune_vitbase14_336.pth",
-                "hf_filename": "dune_vit_base_336/encoder.safetensors",
+                "hf_filename": "encoder.safetensors",
                 "size_mb": 420,
             },
             "decoder": {
                 "url": f"{NAVER_CDN_BASE}/dune/dunemast3r_cvpr25_vitbase.pth",
                 "filename": "dunemast3r_cvpr25_vitbase.pth",
-                "hf_filename": "dune_vit_base_336/decoder.safetensors",
+                "hf_filename": "decoder.safetensors",
                 "size_mb": 1325,
             },
         },
@@ -148,17 +151,18 @@ MODEL_SPECS: dict[ModelVariant, dict] = {
         "depth": 12,
         "native_resolution": 448,
         "hf_repo": HF_REPO_DUNE,
+        "subdir": "dune_vit_base_448",
         "checkpoints": {
             "encoder": {
                 "url": f"{NAVER_CDN_BASE}/dune/dune_vitbase14_448.pth",
                 "filename": "dune_vitbase14_448.pth",
-                "hf_filename": "dune_vit_base_448/encoder.safetensors",
+                "hf_filename": "encoder.safetensors",
                 "size_mb": 420,
             },
             "decoder": {
                 "url": f"{NAVER_CDN_BASE}/dune/dunemast3r_cvpr25_vitbase.pth",
                 "filename": "dunemast3r_cvpr25_vitbase.pth",
-                "hf_filename": "dune_vit_base_448/decoder.safetensors",
+                "hf_filename": "decoder.safetensors",
                 "size_mb": 1325,
             },
         },
@@ -172,6 +176,7 @@ MODEL_SPECS: dict[ModelVariant, dict] = {
         "depth": 24,
         "native_resolution": 512,
         "hf_repo": HF_REPO_MAST3R,
+        "subdir": "mast3r_vit_large",
         "checkpoints": {
             "unified": {
                 "url": f"{NAVER_CDN_BASE}/ComputerVision/MASt3R/MASt3R_ViTLarge_BaseDecoder_512_catmlpdpt_metric.pth",
@@ -467,3 +472,34 @@ def get_total_checkpoint_size_mb(variant: ModelVariant) -> int:
     """
     spec = MODEL_SPECS[variant]
     return sum(ckpt_info["size_mb"] for ckpt_info in spec["checkpoints"].values())
+
+
+def get_default_model_path(
+    variant: ModelVariant,
+    precision: Precision,
+    cache_dir: Path | None = None,
+) -> Path:
+    """Get path to the default safetensors model file.
+
+    Args:
+        variant: Model variant.
+        precision: Inference precision (used for path organization).
+        cache_dir: Optional cache directory. Uses ~/.cache/mast3r_runtime if None.
+
+    Returns:
+        Path to the safetensors model file.
+    """
+    if cache_dir is None:
+        cache_dir = Path.home() / ".cache" / "mast3r_runtime"
+
+    safetensors_dir = cache_dir / "safetensors"
+    spec = MODEL_SPECS[variant]
+
+    # MASt3R uses unified checkpoint, DUNE has separate encoder/decoder
+    subdir = spec.get("subdir", "")
+    if "unified" in spec["checkpoints"]:
+        # MASt3R: single file
+        return safetensors_dir / subdir / spec["checkpoints"]["unified"]["hf_filename"]
+    else:
+        # DUNE: return decoder (which contains the full model)
+        return safetensors_dir / subdir / spec["checkpoints"]["decoder"]["hf_filename"]

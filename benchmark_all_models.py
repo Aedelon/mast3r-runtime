@@ -1,5 +1,5 @@
 #!/usr/bin/env python3
-"""Benchmark all available models on MPSGraph backend.
+"""Benchmark all available models on MPS backend.
 
 Copyright 2024 Delanoe Pirard / Aedelon. Apache 2.0.
 
@@ -26,7 +26,7 @@ def format_size(size_bytes: int) -> str:
 
 def benchmark_model(variant: str, resolution: int, model_path: Path | None) -> dict | None:
     """Benchmark a single model variant."""
-    from mast3r_runtime.backends import _mpsgraph
+    from mast3r_runtime.backends import _mps
 
     if model_path is None or not model_path.exists():
         return None
@@ -38,7 +38,7 @@ def benchmark_model(variant: str, resolution: int, model_path: Path | None) -> d
 
     try:
         # Create engine
-        engine = _mpsgraph.MPSGraphEngine(
+        engine = _mps.MPSEngine(
             variant=variant,
             resolution=resolution,
             precision="fp16",
@@ -100,22 +100,22 @@ def benchmark_model(variant: str, resolution: int, model_path: Path | None) -> d
 
 def main():
     print("\n" + "=" * 60)
-    print("  MASt3R Runtime - Full Model Benchmark (MPSGraph)")
+    print("  MASt3R Runtime - Full Model Benchmark (MPS)")
     print("=" * 60)
 
-    # Check MPSGraph availability
+    # Check MPS availability
     try:
-        from mast3r_runtime.backends import _mpsgraph
+        from mast3r_runtime.backends import _mps
     except ImportError as e:
-        print(f"MPSGraph not available: {e}")
+        print(f"MPS not available: {e}")
         return
 
-    if not _mpsgraph.is_available():
-        print("MPSGraph requires macOS 15+")
+    if not _mps.is_available():
+        print("MPS requires macOS 15+")
         return
 
     # Show device info
-    info = _mpsgraph.get_context_info()
+    info = _mps.get_context_info()
     print(f"\nDevice: {info['device_name']}")
     print(f"Working Set: {format_size(info['recommended_working_set_size'])}")
     print(f"Max Buffer: {format_size(info['max_buffer_length'])}")
@@ -187,7 +187,7 @@ def main():
         print(f"\nFastest: {fastest['variant']} @ {fastest['fps']:.1f} FPS")
 
     # Show final buffer pool stats
-    info = _mpsgraph.get_context_info()
+    info = _mps.get_context_info()
     print(
         f"\nBuffer pool: {info['buffer_pool_count']} buffers, {format_size(info['buffer_pool_bytes'])}"
     )
