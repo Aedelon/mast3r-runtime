@@ -409,5 +409,69 @@ private:
     }
 };
 
+// Multi-file safetensors loader (for DUNE split files)
+class MultiSafetensorsFile {
+public:
+    MultiSafetensorsFile() = default;
+
+    // Add a file to the collection
+    void add_file(const std::string& path) {
+        files_.emplace_back(path);
+        // Merge tensor info
+        for (const auto& name : files_.back().tensor_names()) {
+            file_map_[name] = files_.size() - 1;
+        }
+    }
+
+    // Add multiple files from directory
+    void add_directory(const std::string& dir_path) {
+        // Common safetensor file names
+        std::vector<std::string> names = {"encoder.safetensors", "decoder.safetensors",
+                                           "unified.safetensors", "model.safetensors"};
+        for (const auto& name : names) {
+            std::string full_path = dir_path + "/" + name;
+            std::ifstream test(full_path);
+            if (test.good()) {
+                add_file(full_path);
+            }
+        }
+    }
+
+    bool has_tensor(const std::string& name) const {
+        return file_map_.find(name) != file_map_.end();
+    }
+
+    std::vector<float> load_tensor_f32(const std::string& name) const {
+        auto it = file_map_.find(name);
+        if (it == file_map_.end()) {
+            throw std::runtime_error("Tensor not found: " + name);
+        }
+        return files_[it->second].load_tensor_f32(name);
+    }
+
+    const TensorInfo& tensor_info(const std::string& name) const {
+        auto it = file_map_.find(name);
+        if (it == file_map_.end()) {
+            throw std::runtime_error("Tensor not found: " + name);
+        }
+        return files_[it->second].tensor_info(name);
+    }
+
+    std::vector<std::string> tensor_names() const {
+        std::vector<std::string> names;
+        for (const auto& [name, _] : file_map_) {
+            names.push_back(name);
+        }
+        return names;
+    }
+
+    size_t num_tensors() const { return file_map_.size(); }
+    size_t num_files() const { return files_.size(); }
+
+private:
+    std::vector<SafetensorsFile> files_;
+    std::unordered_map<std::string, size_t> file_map_;  // tensor name -> file index
+};
+
 }  // namespace safetensors
 }  // namespace mast3r

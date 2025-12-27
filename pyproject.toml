@@ -2,7 +2,7 @@
 # Copyright 2024 Delanoe Pirard / Aedelon. Apache 2.0.
 
 [build-system]
-requires = ["scikit-build-core>=0.10", "pybind11>=2.12"]
+requires = ["scikit-build-core>=0.10", "pybind11>=2.12", "cmake>=3.21", "ninja"]
 build-backend = "scikit_build_core.build"
 
 [project]
@@ -108,6 +108,7 @@ wheel.packages = ["mast3r_runtime"]
 # CMake configuration
 cmake.args = [
     "-DBUILD_TESTS=OFF",
+    "-DBUILD_MPSGRAPH=ON",
 ]
 
 # Build in parallel
@@ -117,8 +118,8 @@ make-fallback = true
 # Editable installs
 [tool.scikit-build.editable]
 mode = "redirect"
-rebuild = true
-verbose = true
+rebuild = false
+verbose = false
 
 # ============================================================================
 # Ruff configuration
