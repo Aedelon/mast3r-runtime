@@ -190,6 +190,61 @@ public:
         return linear(attn, proj_w, proj_b);
     }
 
+    // ============================================================================
+    // Batched operations for [B, N, D] tensors (e.g., batch=2 for image pairs)
+    // ============================================================================
+
+    MPSGraphTensor* layer_norm_batched(MPSGraphTensor* x, MPSGraphTensor* w, MPSGraphTensor* b) {
+        // x: [B, N, D], w: [D], b: [D]
+        // Mean/var on last axis broadcasts correctly for batched input
+        auto mean = [graph_ meanOfTensor:x axes:@[@(-1)] name:nil];
+        auto centered = [graph_ subtractionWithPrimaryTensor:x secondaryTensor:mean name:nil];
+        auto var = [graph_ meanOfTensor:[graph_ squareWithTensor:centered name:nil] axes:@[@(-1)] name:nil];
+        auto eps = [graph_ constantWithScalar:LN_EPS shape:@[@1] dataType:dtype_];
+        auto std = [graph_ squareRootWithTensor:[graph_ additionWithPrimaryTensor:var secondaryTensor:eps name:nil] name:nil];
+        auto norm = [graph_ divisionWithPrimaryTensor:centered secondaryTensor:std name:nil];
+        norm = [graph_ multiplicationWithPrimaryTensor:norm secondaryTensor:w name:nil];
+        return [graph_ additionWithPrimaryTensor:norm secondaryTensor:b name:nil];
+    }
+
+    MPSGraphTensor* linear_batched(MPSGraphTensor* x, MPSGraphTensor* w, MPSGraphTensor* b) {
+        // x: [B, N, D], w: [out, D], b: [out]
+        // matmul broadcasts: [B, N, D] @ [D, out] -> [B, N, out]
+        auto wt = [graph_ transposeTensor:w dimension:0 withDimension:1 name:nil];
+        auto out = [graph_ matrixMultiplicationWithPrimaryTensor:x secondaryTensor:wt name:nil];
+        if (b) out = [graph_ additionWithPrimaryTensor:out secondaryTensor:b name:nil];
+        return out;
+    }
+
+    MPSGraphTensor* self_attention_batched(MPSGraphTensor* x, MPSGraphTensor* qkv_w, MPSGraphTensor* qkv_b,
+                                           MPSGraphTensor* proj_w, MPSGraphTensor* proj_b, int heads, int head_dim,
+                                           int batch_size = 2, int num_patches = -1) {
+        // x: [B, N, D] where B=batch_size (e.g., 2 for image pairs)
+        int dim = heads * head_dim;
+        float scale = 1.0f / sqrtf((float)head_dim);
+
+        // QKV projection: [B, N, D] -> [B, N, 3*D]
+        auto qkv = linear_batched(x, qkv_w, qkv_b);
+
+        // Split into Q, K, V: [B, N, D] each
+        auto splits = [graph_ splitTensor:qkv numSplits:3 axis:-1 name:nil];
+
+        // Reshape for SDPA: [B, N, D] -> [B, heads, N, head_dim]
+        NSArray<NSNumber*>* shape = @[@(batch_size), @(heads), @(-1), @(head_dim)];
+        auto Q = [graph_ reshapeTensor:splits[0] withShape:shape name:nil];
+        auto K = [graph_ reshapeTensor:splits[1] withShape:shape name:nil];
+        auto V = [graph_ reshapeTensor:splits[2] withShape:shape name:nil];
+
+        // SDPA: [B, heads, N, head_dim] -> [B, heads, N, head_dim]
+        auto attn = [graph_ scaledDotProductAttentionWithQueryTensor:Q keyTensor:K valueTensor:V maskTensor:nil scale:scale name:nil];
+
+        // Reshape back: [B, heads, N, head_dim] -> [B, N, D]
+        attn = [graph_ reshapeTensor:attn withShape:@[@(batch_size), @(-1), @(dim)] name:nil];
+
+        // Output projection: [B, N, D] -> [B, N, D]
+        return linear_batched(attn, proj_w, proj_b);
+    }
+
     MPSGraphTensor* cross_attention(MPSGraphTensor* x, MPSGraphTensor* y,
                                     MPSGraphTensor* q_w, MPSGraphTensor* q_b,
                                     MPSGraphTensor* k_w, MPSGraphTensor* k_b,
