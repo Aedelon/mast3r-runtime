@@ -60,26 +60,34 @@ def benchmark_model(variant: str, resolution: int, model_path: Path | None) -> d
         print("Warmup (3 iterations)...")
         engine.warmup(3)
 
-        # Benchmark
-        print("Benchmarking (10 iterations)...")
+        # Benchmark with infer_gpu (lazy copy - faster)
+        print("Benchmarking infer_gpu (20 iterations)...")
         times = []
-        for i in range(10):
+        for i in range(20):
             t0 = time.perf_counter()
-            result = engine.infer(img1, img2)
+            result = engine.infer_gpu(img1, img2)
             elapsed = (time.perf_counter() - t0) * 1000
             times.append(elapsed)
-            print(f"  Iter {i + 1:2d}: {elapsed:6.1f} ms")
+            if i < 10:
+                print(f"  Iter {i + 1:2d}: {elapsed:6.1f} ms")
+            elif i == 10:
+                print(f"  ... (10 more iterations)")
 
         avg = np.mean(times)
         std = np.std(times)
         min_t = np.min(times)
         max_t = np.max(times)
 
-        print(f"\nResults:")
+        # Get shapes via numpy conversion (once)
+        pts3d_shape = result.pts3d_1.numpy().shape
+        desc_shape = result.desc_1.numpy().shape
+
+        print(f"\nResults (infer_gpu - no copy):")
         print(f"  Average: {avg:.1f} ms ± {std:.1f} ms")
         print(f"  Min/Max: {min_t:.1f} / {max_t:.1f} ms")
         print(f"  FPS: {1000 / avg:.1f}")
-        print(f"  Output: pts3d={result.pts3d_1.shape}, desc={result.desc_1.shape}")
+        print(f"  Per-image: {avg / 2:.1f} ms ({2000 / avg:.1f} FPS)")
+        print(f"  Output: pts3d={pts3d_shape}, desc={desc_shape}")
 
         return {
             "variant": variant,

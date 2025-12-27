@@ -9,6 +9,7 @@ find_library(MPSGRAPH_LIBRARY MetalPerformanceShadersGraph REQUIRED)
 add_library(mast3r_mps_impl STATIC
     mpsgraph_context.mm
     mpsgraph_engine.mm
+    gpu_tensor.mm
 )
 
 target_include_directories(mast3r_mps_impl PUBLIC

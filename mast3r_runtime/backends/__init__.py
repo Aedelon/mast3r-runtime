@@ -37,9 +37,9 @@ def get_available_backends() -> dict[str, bool]:
         backends["cpu"] = False
 
     try:
-        from . import _metal
+        from . import _mps
 
-        backends["metal"] = _metal.is_available()
+        backends["metal"] = _mps.is_available()
     except ImportError:
         backends["metal"] = False
 
@@ -117,11 +117,11 @@ def get_backend_info() -> dict:
     # Get backend-specific details
     if available.get("metal"):
         try:
-            from . import _metal
+            from . import _mps
 
             info["details"]["metal"] = {
-                "device": _metal.get_device_name(),
-                "unified_memory": _metal.has_unified_memory(),
+                "device": _mps.get_device_name(),
+                "unified_memory": _mps.has_unified_memory(),
             }
         except Exception:
             pass
@@ -164,11 +164,11 @@ def get_runtime(config: MASt3RRuntimeConfig) -> EngineInterface:
     # Import and return the appropriate engine
     if backend_name == "metal":
         try:
-            from ._metal import MetalEngine
+            from ._mps import MPSEngine
 
-            return _create_native_engine(MetalEngine, config)
+            return _create_native_engine(MPSEngine, config)
         except ImportError as e:
-            raise RuntimeError(f"Metal backend not available: {e}") from e
+            raise RuntimeError(f"MPS backend not available: {e}") from e
 
     elif backend_name == "cuda":
         try:

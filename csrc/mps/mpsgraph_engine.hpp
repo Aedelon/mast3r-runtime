@@ -10,6 +10,7 @@
 
 #include "../common/types.hpp"
 #include "mpsgraph_context.hpp"
+#include "gpu_tensor.hpp"
 
 namespace mast3r {
 namespace mpsgraph {
@@ -53,8 +54,13 @@ public:
     // Warmup
     void warmup(int num_iterations = 3);
 
-    // Inference on image pair
+    // Inference on image pair (copies to CPU - legacy)
     InferenceResult infer(const ImageView& img1, const ImageView& img2);
+
+    // Inference returning GPU handles (lazy copy - faster)
+    // Data stays on GPU until .numpy() is called on each tensor.
+    // This eliminates ~420ms of copy overhead when data isn't needed immediately.
+    GPUInferenceResult infer_gpu(const ImageView& img1, const ImageView& img2);
 
     // Feature matching
     MatchResult match(
@@ -102,11 +108,19 @@ private:
     // Graph (not shared - each engine has its own compiled graph)
     MPSGraph* graph_ = nil;
 
+    // Pre-compiled executables (faster than JIT compilation each run)
+    MPSGraphExecutable* main_executable_ = nil;      // Main inference graph
+    MPSGraphExecutable* encoder_executable_ = nil;   // Encoder-only for retrieval
+    MPSGraphExecutable* whitening_executable_ = nil; // Whitening graph
+    MPSGraphExecutable* retrieval_executable_ = nil; // Standalone retrieval
+
     // Placeholders (uint8 input for GPU preprocessing)
     MPSGraphTensor* input_placeholder_ = nil;  // [1, H, W, 3] uint8
 
     // Output tensors
-    MPSGraphTensor* output_pts3d_conf_ = nil;
+    MPSGraphTensor* output_pts3d_conf_ = nil;  // [1, H, W, 4] combined (legacy)
+    MPSGraphTensor* output_pts3d_ = nil;       // [1, H, W, 3] split in graph
+    MPSGraphTensor* output_conf_ = nil;        // [1, H, W] split in graph
     MPSGraphTensor* output_descriptors_ = nil;
     MPSGraphTensor* output_enc_features_ = nil;  // Encoder output [N, D] for retrieval
 
@@ -127,6 +141,32 @@ private:
 
     // Preprocessing
     void preprocess(const ImageView& img, float* output);
+
+    // Pre-allocated output buffers (shared memory for zero-copy)
+    // Using two sets for async dual-image inference
+    // MTLBuffers must be stored to prevent ARC release
+    id<MTLBuffer> buf_pts3d_1_ = nil;
+    id<MTLBuffer> buf_pts3d_2_ = nil;
+    id<MTLBuffer> buf_conf_1_ = nil;
+    id<MTLBuffer> buf_conf_2_ = nil;
+    id<MTLBuffer> buf_desc_1_ = nil;
+    id<MTLBuffer> buf_desc_2_ = nil;
+
+    // Wrapped as MPSGraphTensorData for resultsDictionary
+    MPSGraphTensorData* out_pts3d_1_ = nil;
+    MPSGraphTensorData* out_pts3d_2_ = nil;
+    MPSGraphTensorData* out_conf_1_ = nil;
+    MPSGraphTensorData* out_conf_2_ = nil;
+    MPSGraphTensorData* out_desc_1_ = nil;
+    MPSGraphTensorData* out_desc_2_ = nil;
+
+    // Direct pointers to shared buffer data (zero-copy access)
+    float* ptr_pts3d_1_ = nullptr;
+    float* ptr_pts3d_2_ = nullptr;
+    float* ptr_conf_1_ = nullptr;
+    float* ptr_conf_2_ = nullptr;
+    float* ptr_desc_1_ = nullptr;
+    float* ptr_desc_2_ = nullptr;
 };
 
 }  // namespace mpsgraph

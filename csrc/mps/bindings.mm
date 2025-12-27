@@ -59,6 +59,49 @@ struct PyRetrievalResult {
     py::dict timing;
 };
 
+// Python wrapper for GPUTensor - lazy copy pattern
+class PyGPUTensor {
+public:
+    PyGPUTensor(GPUTensor&& tensor) : tensor_(std::move(tensor)) {}
+
+    py::tuple shape() const {
+        const auto& s = tensor_.shape();
+        py::tuple result(s.size());
+        for (size_t i = 0; i < s.size(); i++) {
+            result[i] = s[i];
+        }
+        return result;
+    }
+
+    size_t numel() const { return tensor_.numel(); }
+    size_t nbytes() const { return tensor_.nbytes(); }
+    size_t ndim() const { return tensor_.ndim(); }
+    bool is_valid() const { return tensor_.is_valid(); }
+
+    // The expensive copy operation - called explicitly by user
+    py::array_t<float> numpy() const {
+        const auto& s = tensor_.shape();
+        std::vector<py::ssize_t> py_shape(s.begin(), s.end());
+        py::array_t<float> result(py_shape);
+        tensor_.copy_to(result.mutable_data());
+        return result;
+    }
+
+private:
+    GPUTensor tensor_;
+};
+
+// Python wrapper for GPUInferenceResult
+struct PyGPUInferenceResult {
+    std::shared_ptr<PyGPUTensor> pts3d_1;
+    std::shared_ptr<PyGPUTensor> pts3d_2;
+    std::shared_ptr<PyGPUTensor> conf_1;
+    std::shared_ptr<PyGPUTensor> conf_2;
+    std::shared_ptr<PyGPUTensor> desc_1;
+    std::shared_ptr<PyGPUTensor> desc_2;
+    py::dict timing;
+};
+
 // Python wrapper class
 class PyMPSEngine {
 public:
@@ -149,6 +192,33 @@ public:
         delete[] result.desc_2;
         delete[] result.conf_1;
         delete[] result.conf_2;
+
+        py_result.timing["preprocess_ms"] = result.preprocess_ms;
+        py_result.timing["inference_ms"] = result.inference_ms;
+        py_result.timing["total_ms"] = result.total_ms;
+
+        return py_result;
+    }
+
+    // GPU tensor version - data stays on GPU until .numpy() is called
+    PyGPUInferenceResult infer_gpu(
+        py::array_t<uint8_t> img1,
+        py::array_t<uint8_t> img2
+    ) {
+        auto view1 = numpy_to_image_view(img1);
+        auto view2 = numpy_to_image_view(img2);
+
+        auto result = engine_->infer_gpu(view1, view2);
+
+        PyGPUInferenceResult py_result;
+
+        // Wrap GPU tensors - NO COPY here, data stays on GPU
+        py_result.pts3d_1 = std::make_shared<PyGPUTensor>(std::move(result.pts3d_1));
+        py_result.pts3d_2 = std::make_shared<PyGPUTensor>(std::move(result.pts3d_2));
+        py_result.conf_1 = std::make_shared<PyGPUTensor>(std::move(result.conf_1));
+        py_result.conf_2 = std::make_shared<PyGPUTensor>(std::move(result.conf_2));
+        py_result.desc_1 = std::make_shared<PyGPUTensor>(std::move(result.desc_1));
+        py_result.desc_2 = std::make_shared<PyGPUTensor>(std::move(result.desc_2));
 
         py_result.timing["preprocess_ms"] = result.preprocess_ms;
         py_result.timing["inference_ms"] = result.inference_ms;
@@ -249,6 +319,7 @@ public:
 
         py_result.timing["preprocess_ms"] = result.preprocess_ms;
         py_result.timing["encoder_ms"] = result.encoder_ms;
+        py_result.timing["whiten_ms"] = result.whiten_ms;
         py_result.timing["total_ms"] = result.total_ms;
 
         return py_result;
@@ -284,6 +355,7 @@ public:
             delete[] result.attention;
 
             py_result.timing["encoder_ms"] = result.encoder_ms;
+            py_result.timing["whiten_ms"] = result.whiten_ms;
             py_result.timing["total_ms"] = result.total_ms;
 
             py_results.push_back(std::move(py_result));
@@ -324,6 +396,27 @@ PYBIND11_MODULE(_mps, m) {
         .def_readonly("attention", &PyRetrievalResult::attention)
         .def_readonly("timing", &PyRetrievalResult::timing);
 
+    // GPU Tensor - lazy copy pattern
+    py::class_<PyGPUTensor, std::shared_ptr<PyGPUTensor>>(m, "GPUTensor")
+        .def_property_readonly("shape", &PyGPUTensor::shape)
+        .def_property_readonly("numel", &PyGPUTensor::numel)
+        .def_property_readonly("nbytes", &PyGPUTensor::nbytes)
+        .def_property_readonly("ndim", &PyGPUTensor::ndim)
+        .def_property_readonly("is_valid", &PyGPUTensor::is_valid)
+        .def("numpy", &PyGPUTensor::numpy,
+             "Copy data from GPU to CPU and return as NumPy array. "
+             "This is the expensive operation - call only when needed.");
+
+    // GPU Inference Result - holds GPU tensor handles
+    py::class_<PyGPUInferenceResult>(m, "GPUInferenceResult")
+        .def_readonly("pts3d_1", &PyGPUInferenceResult::pts3d_1)
+        .def_readonly("pts3d_2", &PyGPUInferenceResult::pts3d_2)
+        .def_readonly("conf_1", &PyGPUInferenceResult::conf_1)
+        .def_readonly("conf_2", &PyGPUInferenceResult::conf_2)
+        .def_readonly("desc_1", &PyGPUInferenceResult::desc_1)
+        .def_readonly("desc_2", &PyGPUInferenceResult::desc_2)
+        .def_readonly("timing", &PyGPUInferenceResult::timing);
+
     py::class_<PyMPSEngine>(m, "MPSEngine")
         .def(py::init<const std::string&, int, const std::string&, int>(),
              py::arg("variant") = "mast3r_vit_large",
@@ -334,7 +427,13 @@ PYBIND11_MODULE(_mps, m) {
         .def("is_ready", &PyMPSEngine::is_ready)
         .def("name", &PyMPSEngine::name)
         .def("warmup", &PyMPSEngine::warmup, py::arg("num_iterations") = 3)
-        .def("infer", &PyMPSEngine::infer)
+        .def("infer", &PyMPSEngine::infer,
+             "Run inference and copy results to CPU (legacy). "
+             "Use infer_gpu() for lazy-copy pattern.")
+        .def("infer_gpu", &PyMPSEngine::infer_gpu,
+             "Run inference returning GPU tensor handles (fast). "
+             "Data stays on GPU until .numpy() is called on each tensor. "
+             "This eliminates ~420ms of copy overhead when data isn't needed immediately.")
         .def("match", &PyMPSEngine::match,
              py::arg("desc_1"),
              py::arg("desc_2"),

@@ -56,7 +56,7 @@ def test_retrieval():
     engine = _mps.MPSEngine(
         variant="mast3r_vit_large",
         resolution=512,
-        precision="fp32",
+        precision="fp16",
         num_threads=4,
     )
 
@@ -106,6 +106,7 @@ def test_retrieval():
     print("\nTiming:")
     print(f"  Preprocess: {result.timing.get('preprocess_ms', 0):.1f} ms")
     print(f"  Encoder:    {result.timing.get('encoder_ms', 0):.1f} ms")
+    print(f"  Whitening:  {result.timing.get('whiten_ms', 0):.1f} ms")
     print(f"  Total:      {result.timing.get('total_ms', 0):.1f} ms")
 
     # Top-k attention (select most salient patches)

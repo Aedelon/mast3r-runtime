@@ -53,10 +53,12 @@ classifiers = [
 
 # Minimal dependencies for core functionality
 dependencies = [
+    "huggingface-hub>=1.2.3",
     "numpy>=1.24",
     "pillow>=10.0",
     "pydantic>=2.0",
     "pyyaml>=6.0",
+    "torch>=2.9.1",
 ]
 
 [project.optional-dependencies]
@@ -71,8 +73,6 @@ dev = [
 
 # Export tools (requires PyTorch + MASt3R)
 export = [
-    "torch>=2.0",
-    "torchvision>=0.15",
     "safetensors>=0.4",
 ]
 
@@ -99,17 +99,17 @@ mast3r-runtime = "mast3r_runtime.cli:main"
 # Minimum CMake version
 cmake.version = ">=3.21"
 
-# Build directory
-build-dir = "build/{wheel_tag}"
-
-# Wheel configuration - include Python package + native extensions
-wheel.packages = ["mast3r_runtime"]
-
 # CMake configuration
 cmake.args = [
     "-DBUILD_TESTS=OFF",
     "-DBUILD_MPS=ON",
 ]
+
+# Build directory
+build-dir = "build/{wheel_tag}"
+
+# Wheel configuration - include Python package + native extensions
+wheel.packages = ["mast3r_runtime"]
 
 # Build in parallel
 [tool.scikit-build.ninja]

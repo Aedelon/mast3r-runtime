@@ -1,7 +1,7 @@
 #!/usr/bin/env python3
-"""Test all MASt3R/DUNE models with Metal backend.
+"""Test all MASt3R/DUNE models with MPS backend.
 
-Uses subprocess isolation to avoid Metal memory issues between model loads.
+Uses subprocess isolation to avoid MPS memory issues between model loads.
 """
 
 import subprocess
@@ -111,16 +111,16 @@ def main():
     print("MASt3R Runtime - All Models Test")
     print("=" * 70)
 
-    # Check Metal availability
+    # Check MPS availability
     try:
-        from mast3r_runtime.backends import _metal
+        from mast3r_runtime.backends import _mps
 
-        if not _metal.is_available():
-            print("ERROR: Metal backend not available!")
+        if not _mps.is_available():
+            print("ERROR: MPS backend not available!")
             return 1
-        print(f"Metal device: {_metal.get_device_name()}\n")
+        print(f"MPS device: {_mps.get_device_name()}\n")
     except ImportError as e:
-        print(f"ERROR: Cannot import Metal backend: {e}")
+        print(f"ERROR: Cannot import MPS backend: {e}")
         return 1
 
     # Define models to test
