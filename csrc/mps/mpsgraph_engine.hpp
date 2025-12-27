@@ -74,6 +74,9 @@ public:
     // Encoder-only mode for retrieval (returns whitened features + attention)
     RetrievalResult encode_retrieval(const ImageView& img);
 
+    // Batch retrieval with async pipelining (higher throughput)
+    std::vector<RetrievalResult> encode_retrieval_batch(const std::vector<ImageView>& images);
+
     // Check if retrieval is ready
     bool is_retrieval_ready() const { return is_retrieval_loaded_; }
 

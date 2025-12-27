@@ -254,6 +254,44 @@ public:
         return py_result;
     }
 
+    // Batch retrieval with async pipelining
+    std::vector<PyRetrievalResult> encode_retrieval_batch(py::list images) {
+        std::vector<ImageView> views;
+        views.reserve(py::len(images));
+
+        for (auto& item : images) {
+            views.push_back(numpy_to_image_view(item.cast<py::array_t<uint8_t>>()));
+        }
+
+        auto results = engine_->encode_retrieval_batch(views);
+
+        std::vector<PyRetrievalResult> py_results;
+        py_results.reserve(results.size());
+
+        for (auto& result : results) {
+            PyRetrievalResult py_result;
+
+            const int N = result.num_patches;
+            const int D = result.feature_dim;
+
+            py_result.features = py::array_t<float>({N, D});
+            py_result.attention = py::array_t<float>(N);
+
+            std::memcpy(py_result.features.mutable_data(), result.features, N * D * sizeof(float));
+            std::memcpy(py_result.attention.mutable_data(), result.attention, N * sizeof(float));
+
+            delete[] result.features;
+            delete[] result.attention;
+
+            py_result.timing["encoder_ms"] = result.encoder_ms;
+            py_result.timing["total_ms"] = result.total_ms;
+
+            py_results.push_back(std::move(py_result));
+        }
+
+        return py_results;
+    }
+
 private:
     std::unique_ptr<MPSGraphEngine> engine_;
 };
@@ -311,7 +349,10 @@ PYBIND11_MODULE(_mps, m) {
              "Load retrieval in standalone mode (encoder + whitening only, no main model needed)")
         .def("is_retrieval_ready", &PyMPSEngine::is_retrieval_ready)
         .def("is_retrieval_standalone", &PyMPSEngine::is_retrieval_standalone)
-        .def("encode_retrieval", &PyMPSEngine::encode_retrieval);
+        .def("encode_retrieval", &PyMPSEngine::encode_retrieval)
+        .def("encode_retrieval_batch", &PyMPSEngine::encode_retrieval_batch,
+             py::arg("images"),
+             "Batch retrieval with async pipelining for higher throughput");
 
     // Module info
     m.def("is_available", []() {

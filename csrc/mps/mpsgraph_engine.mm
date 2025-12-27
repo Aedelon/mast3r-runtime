@@ -1130,5 +1130,165 @@ RetrievalResult MPSGraphEngine::encode_retrieval(const ImageView& img) {
     return result;
 }
 
+std::vector<RetrievalResult> MPSGraphEngine::encode_retrieval_batch(const std::vector<ImageView>& images) {
+    std::vector<RetrievalResult> results(images.size());
+
+    if (!is_retrieval_loaded_) {
+        throw std::runtime_error("Retrieval weights not loaded. Call load_retrieval() first.");
+    }
+
+    if (images.empty()) return results;
+
+    if (@available(macOS 15.0, *)) {
+        @autoreleasepool {
+            auto total_start = std::chrono::high_resolution_clock::now();
+
+            ModelConfig cfg = ModelConfig::from_variant(config_.variant);
+            const int IMG_H = config_.resolution;
+            const int IMG_W = static_cast<int>(config_.resolution * 4.0f / 3.0f);
+            const int PATCH_H = IMG_H / cfg.patch_size;
+            const int PATCH_W = IMG_W / cfg.patch_size;
+            const int NUM_PATCHES = PATCH_H * PATCH_W;
+            const size_t N = images.size();
+
+            // Prepare all input tensors
+            std::vector<MPSGraphTensorData*> input_tds(N);
+            for (size_t i = 0; i < N; i++) {
+                MPSNDArrayDescriptor* img_desc = [MPSNDArrayDescriptor descriptorWithDataType:MPSDataTypeUInt8
+                                                                                        shape:@[@1, @(IMG_H), @(IMG_W), @3]];
+                MPSNDArray* img_arr = [[MPSNDArray alloc] initWithDevice:ctx_->device() descriptor:img_desc];
+                [img_arr writeBytes:(void*)images[i].data strideBytes:nil];
+                input_tds[i] = [[MPSGraphTensorData alloc] initWithMPSNDArray:img_arr];
+            }
+
+            if (is_retrieval_standalone_) {
+                // ================================================================
+                // STANDALONE MODE: Launch all async, wait for all
+                // ================================================================
+                std::vector<dispatch_semaphore_t> semaphores(N);
+                __block NSMutableArray* all_results = [NSMutableArray arrayWithCapacity:N];
+                for (size_t i = 0; i < N; i++) {
+                    [all_results addObject:[NSNull null]];
+                }
+
+                for (size_t i = 0; i < N; i++) {
+                    semaphores[i] = dispatch_semaphore_create(0);
+
+                    MPSGraphExecutionDescriptor* execDesc = [[MPSGraphExecutionDescriptor alloc] init];
+                    dispatch_semaphore_t sem = semaphores[i];
+                    size_t idx = i;
+
+                    execDesc.completionHandler = ^(NSDictionary<MPSGraphTensor*, MPSGraphTensorData*>* res, NSError* err) {
+                        all_results[idx] = res;
+                        dispatch_semaphore_signal(sem);
+                    };
+
+                    [retrieval_graph_ runAsyncWithMTLCommandQueue:ctx_->queue()
+                                                            feeds:@{retrieval_input_: input_tds[i]}
+                                                    targetTensors:@[retrieval_features_, retrieval_attention_]
+                                                 targetOperations:nil
+                                              executionDescriptor:execDesc];
+                }
+
+                // Wait for all and copy results
+                for (size_t i = 0; i < N; i++) {
+                    dispatch_semaphore_wait(semaphores[i], DISPATCH_TIME_FOREVER);
+
+                    results[i].num_patches = NUM_PATCHES;
+                    results[i].feature_dim = cfg.enc_dim;
+                    results[i].features = new float[NUM_PATCHES * cfg.enc_dim];
+                    results[i].attention = new float[NUM_PATCHES];
+
+                    NSDictionary* res = all_results[i];
+                    [[res[retrieval_features_] mpsndarray] readBytes:results[i].features strideBytes:nil];
+                    [[res[retrieval_attention_] mpsndarray] readBytes:results[i].attention strideBytes:nil];
+                }
+
+            } else {
+                // ================================================================
+                // WEIGHT SHARING MODE: Pipeline encoder[i] with whitening[i-1]
+                // ================================================================
+                std::vector<dispatch_semaphore_t> enc_sems(N);
+                std::vector<dispatch_semaphore_t> whiten_sems(N);
+                __block NSMutableArray* enc_results = [NSMutableArray arrayWithCapacity:N];
+                __block NSMutableArray* whiten_results = [NSMutableArray arrayWithCapacity:N];
+                for (size_t i = 0; i < N; i++) {
+                    [enc_results addObject:[NSNull null]];
+                    [whiten_results addObject:[NSNull null]];
+                }
+
+                // Launch all encoder executions async
+                for (size_t i = 0; i < N; i++) {
+                    enc_sems[i] = dispatch_semaphore_create(0);
+
+                    MPSGraphExecutionDescriptor* execDesc = [[MPSGraphExecutionDescriptor alloc] init];
+                    dispatch_semaphore_t sem = enc_sems[i];
+                    size_t idx = i;
+
+                    execDesc.completionHandler = ^(NSDictionary<MPSGraphTensor*, MPSGraphTensorData*>* res, NSError* err) {
+                        enc_results[idx] = res;
+                        dispatch_semaphore_signal(sem);
+                    };
+
+                    [graph_ runAsyncWithMTLCommandQueue:ctx_->queue()
+                                                  feeds:@{input_placeholder_: input_tds[i]}
+                                          targetTensors:@[output_enc_features_]
+                                       targetOperations:nil
+                                    executionDescriptor:execDesc];
+                }
+
+                // Pipeline: as each encoder finishes, launch whitening
+                for (size_t i = 0; i < N; i++) {
+                    dispatch_semaphore_wait(enc_sems[i], DISPATCH_TIME_FOREVER);
+
+                    whiten_sems[i] = dispatch_semaphore_create(0);
+
+                    MPSGraphExecutionDescriptor* execDesc = [[MPSGraphExecutionDescriptor alloc] init];
+                    dispatch_semaphore_t sem = whiten_sems[i];
+                    size_t idx = i;
+
+                    execDesc.completionHandler = ^(NSDictionary<MPSGraphTensor*, MPSGraphTensorData*>* res, NSError* err) {
+                        whiten_results[idx] = res;
+                        dispatch_semaphore_signal(sem);
+                    };
+
+                    NSDictionary* enc_res = enc_results[i];
+                    MPSGraphTensorData* enc_td = enc_res[output_enc_features_];
+                    [whitening_graph_ runAsyncWithMTLCommandQueue:ctx_->queue()
+                                                            feeds:@{whitening_input_: enc_td}
+                                                    targetTensors:@[whitening_output_, whitening_attention_]
+                                                 targetOperations:nil
+                                              executionDescriptor:execDesc];
+                }
+
+                // Wait for all whitening and copy results
+                for (size_t i = 0; i < N; i++) {
+                    dispatch_semaphore_wait(whiten_sems[i], DISPATCH_TIME_FOREVER);
+
+                    results[i].num_patches = NUM_PATCHES;
+                    results[i].feature_dim = cfg.enc_dim;
+                    results[i].features = new float[NUM_PATCHES * cfg.enc_dim];
+                    results[i].attention = new float[NUM_PATCHES];
+
+                    NSDictionary* res = whiten_results[i];
+                    [[res[whitening_output_] mpsndarray] readBytes:results[i].features strideBytes:nil];
+                    [[res[whitening_attention_] mpsndarray] readBytes:results[i].attention strideBytes:nil];
+                }
+            }
+
+            auto total_end = std::chrono::high_resolution_clock::now();
+            float total_ms = std::chrono::duration<double, std::milli>(total_end - total_start).count();
+            float per_image_ms = total_ms / N;
+
+            for (size_t i = 0; i < N; i++) {
+                results[i].total_ms = per_image_ms;
+                results[i].encoder_ms = per_image_ms;  // Approximation for batch
+            }
+        }
+    }
+
+    return results;
+}
+
 }  // namespace mpsgraph
 }  // namespace mast3r
